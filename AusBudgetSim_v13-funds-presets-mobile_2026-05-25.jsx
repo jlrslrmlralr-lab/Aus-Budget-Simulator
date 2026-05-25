@@ -1,0 +1,6532 @@
+import { useState, useMemo, useCallback, useRef, useEffect, createContext, useContext } from "react";
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, ReferenceLine, Legend
+} from "recharts";
+
+// ─── GLOBAL COLLAPSE CONTEXT ─────────────────────────────────────────────────
+// null  = sections use their own internal open/close state (default)
+// true  = all sections forced open
+// false = all sections forced closed
+const CollapseCtx = createContext(null);
+
+// ─── INCOME POOLS ────────────────────────────────────────────────────────────
+// Effective taxable income ($B) in each band, recalibrated to ATO 2026-27 data.
+// Bracket boundaries reflect Stage 3 thresholds (in effect since 1 July 2024)
+// and Stage 4 rates (in effect from 1 July 2026, now live).
+// Pools sized to reproduce the gross individuals + trusts figure of ~$425B
+// (Table 5.7 of Budget Paper No. 1, 2026–27 Budget).
+const INCOME_POOLS = [
+  { min: 0,       max: 18200,    incomeB: 0   }, // Tax-free threshold
+  { min: 18201,   max: 30000,    incomeB: 110 }, // Lower part 1
+  { min: 30001,   max: 45000,    incomeB: 170 }, // Lower part 2 → 280B @ 15% = $42B
+  { min: 45001,   max: 60000,    incomeB: 160 }, //
+  { min: 60001,   max: 80000,    incomeB: 180 }, // Middle bands
+  { min: 80001,   max: 100000,   incomeB: 160 }, //
+  { min: 100001,  max: 120000,   incomeB: 130 }, //
+  { min: 120001,  max: 135000,   incomeB: 110 }, // → 740B @ 30% = $222B
+  { min: 135001,  max: 150000,   incomeB: 40  }, //
+  { min: 150001,  max: 180000,   incomeB: 100 }, //
+  { min: 180001,  max: 190000,   incomeB: 30  }, // → 170B @ 37% = $62.9B
+  { min: 190001,  max: 250000,   incomeB: 50  }, //
+  { min: 250001,  max: 500000,   incomeB: 90  }, // → 220B @ 45% = $99B
+  { min: 500001,  max: 1000000,  incomeB: 40  }, //
+  { min: 1000001, max: Infinity, incomeB: 40  }, //
+];
+
+// ─── 2026-27 BUDGET BASELINES ───────────────────────────────────────────────
+// Source: Budget Paper No. 1, Statement 3 and Statement 5 (12 May 2026)
+const GDP                  = 3094;     // $B nominal GDP 2026-27 (BP1 Supplementary Data)
+const BASELINE_DEFICIT     = -31.5;    // $B underlying cash balance (BP1 Table 3.1)
+const BASELINE_RECEIPTS    = 798.1;    // $B total receipts (BP1 Table 5.7)
+const BASELINE_PAYMENTS    = 829.6;    // $B total payments (BP1 Table 6.1)
+const BASELINE_COMPANY     = 154.0;    // $B company tax (BP1 Table 5.7; total company income tax)
+const MEDICARE_BASE        = 1500;     // $B taxable income base for Medicare sensitivity
+const DEBT_INTEREST_BASE   = 31.9;     // $B net interest on Cth debt (BP1 6.17; → $46.9B by 2029-30)
+const GST_PASS_THROUGH     = 104.2;    // $B GST entitlement to states (BP3 Table 3.2)
+const STATE_PAYMENTS_TOTAL = 207.8;    // $B total Cth payments to states & territories (BP3 Table 1.1)
+
+// ─── COMMONWEALTH INVESTMENT FUND AUM ──────────────────────────────────────
+// All AUM figures as at 31 December 2025 (Future Fund Board of Guardians
+// Portfolio Update, 4 February 2026), plus separate fund corporations.
+// Sources cited inline.
+//
+// Future Fund Board of Guardians (FFBoG) manages 7 funds, $335.3B total AUM
+// (Future Fund Act 2006). Mandate target returns vary by fund.
+const AUM_FUTURE_FUND      = 267.4;   // $B (Future Fund, target CPI+4-5%)
+const AUM_MRFF             = 24.2;    // $B (Medical Research Future Fund Act 2015; RBA cash + 1.5-2%)
+const AUM_DCAF             = 17.8;    // $B (DisabilityCare Australia Fund Act 2013; conservative)
+const AUM_ATSILSFF         = 2.6;     // $B (ATSI Land and Sea Future Fund; CPI+2-3%)
+const AUM_FDF              = 5.2;     // $B (Future Drought Fund Act 2019; CPI+2-3%)
+const AUM_DRF              = 4.7;     // $B (Disaster Ready Fund; CPI+2-3%; was ERF until 2023)
+const AUM_HAFF             = 11.5;    // $B (Housing Australia Future Fund Act 2023; CPI+2-3%)
+// Separate Commonwealth investment corporations (not under FFBoG)
+const AUM_CEFC             = 30.5;    // $B (Clean Energy Finance Corporation Act 2012; total capital allocation)
+const AUM_NRFC             = 15.0;    // $B (National Reconstruction Fund Corporation Act 2023;
+                                       //     $5B credited + $10B to be credited by 2 July 2029;
+                                       //     includes $5B Net Zero Fund sub-fund per Sept 2025 announcement)
+const AUM_FUNDS_TOTAL      = AUM_FUTURE_FUND + AUM_MRFF + AUM_DCAF + AUM_ATSILSFF +
+                             AUM_FDF + AUM_DRF + AUM_HAFF + AUM_CEFC + AUM_NRFC;
+                                       // ≈ $379B aggregate Commonwealth investment fund AUM
+
+// Baseline annual disbursements (currently in the existing spending levers)
+// MRFF disburses ~$650M/yr to medical research (already inside nhmrcFund context).
+// HAFF requires $500M/yr transfers to housing (already inside housingP).
+// DRF allows up to $200M/yr.
+// These are NOT additional spending if levers are set to baseline — the
+// disbursement sliders add/subtract relative to baseline.
+
+// ─── COMPANY TAX (proposed progressive model) ───────────────────────────────
+// Currently Australia has a binary system: 25% (base rate entity, turnover <$50M
+// and ≤80% passive income) and 30% (all others). This is a HYPOTHETICAL
+// progressive structure for modelling, distributing aggregate corporate taxable
+// profit (~$550B) across six bands by taxable profit. Pools calibrated so the
+// defaults (25%/25%/25%/25%/30%/30%) reproduce the ~$154B baseline.
+// Sources: ATO Corporate Tax Transparency reports, BP1 Statement 5 Table 5.7.
+const COMPANY_PROFIT_POOLS = [
+  { min: 0,           max: 50000,     poolB: 15  }, // Micro entities (~$15B aggregate profit)
+  { min: 50000,       max: 500000,    poolB: 50  }, // Small business
+  { min: 500000,      max: 5000000,   poolB: 80  }, // SME
+  { min: 5000000,     max: 50000000,  poolB: 130 }, // Medium ($50M turnover threshold near top of range)
+  { min: 50000000,    max: 250000000, poolB: 115 }, // Large
+  { min: 250000000,   max: Infinity,  poolB: 170 }, // Very large / multinational tier (~ATO Top 100)
+];
+// Sum: $560B aggregate corporate taxable profit base.
+// Default rates: 25, 25, 25, 25, 30, 30 → $154B (matches baseline).
+const DEFAULT_COMPANY_BRACKETS = [
+  { id: 1, min: 0,           max: 50000,     rate: 25 },
+  { id: 2, min: 50000,       max: 500000,    rate: 25 },
+  { id: 3, min: 500000,      max: 5000000,   rate: 25 },
+  { id: 4, min: 5000000,     max: 50000000,  rate: 25 },
+  { id: 5, min: 50000000,    max: 250000000, rate: 30 },
+  { id: 6, min: 250000000,   max: Infinity,  rate: 30 },
+];
+
+// Calculate aggregate company tax under bracketed system.
+function calcCompanyTax(brackets) {
+  const sorted = [...brackets].sort((a, b) => a.min - b.min);
+  let total = 0;
+  for (const b of sorted) {
+    // Each bracket's pool is the aggregate corporate taxable profit in that band.
+    const pool = COMPANY_PROFIT_POOLS.find(p => p.min === b.min && (p.max === b.max || (p.max === Infinity && b.max === Infinity)));
+    if (pool) total += pool.poolB * (b.rate / 100);
+  }
+  return total;
+}
+
+// ─── FORWARD ESTIMATES & MEDIUM-TERM PROJECTION ─────────────────────────────
+// Sources: BP1 Statement 3 Table 3.1 (UCB), Statement 6 Table 6.1 (payments),
+// Statement 5 Table 5.7 (receipts), Statement 3 sheet 3.11 (gross debt % GDP),
+// Statement 3 sheet 3.14 (structural balance decomposition).
+// Years 0–4 align with the four published forward estimates plus one
+// medium-term projection year drawn from the chart data series.
+const FORWARD = {
+  years:        ['2026-27', '2027-28', '2028-29', '2029-30', '2030-31'],
+  gdp:          [3094, 3183, 3334, 3506, 3686],          // $B nominal
+  receipts:     [798.1, 822.9, 848.4, 894.8, 947.3],     // $B (BP1 Table 5.7 + projection)
+  payments:     [829.6, 853.9, 882.8, 920.1, 977.0],     // $B (BP1 Table 6.1 + projection)
+  ucbPct:       [-1.0, -1.0, -1.0, -0.7, -0.8],          // % GDP headline UCB (sheet 3.1)
+  structPct:    [-1.5, -1.0, -1.0, -0.7, -0.8],          // % GDP structural (sheet 3.14)
+  cyclicalPct:  [ 0.5,  0.1, -0.1, -0.1,  0.0],          // % GDP cyclical (oil shock)
+  grossDebtPct: [34.0, 35.2, 35.8, 35.6, 35.4],          // % GDP (sheet 3.11; peak 2028-29)
+  pdi:          [31.9, 38.5, 42.3, 46.9, 51.1],          // $B public debt interest (8.77% CAGR)
+};
+
+// Program-specific CAGRs from BP1 Statement 3 sheet 3.8 (2026-27 Budget column).
+// Used for category-aware compounding of spending levers across forward years.
+const PROGRAM_CAGRS = {
+  ndis:      0.0356,   // post-reform: 3.56% (was 7.62% pre-reform)
+  hospitals: 0.0726,   // NHRA Addendum: fastest-growing major program
+  defence:   0.0638,   // NDS/IIP trajectory
+  mbs:       0.0513,   // Medicare Benefits Schedule
+  agedCare:  0.0536,   // Support at Home growth
+  childCare: 0.0544,   // CCS growth
+  pdi:       0.0877,   // locked: debt-service compounding
+  nominal:   0.0440,   // ~ nominal GDP growth (used for general/revenue scaling)
+};
+
+// Income tax brackets — Stage 4 (in effect from 1 July 2026)
+const DEFAULT_BRACKETS = [
+  { id: 1, min: 0,      max: 18200,    rate: 0  },
+  { id: 2, min: 18201,  max: 45000,    rate: 15 }, // Stage 4: 16% → 15%
+  { id: 3, min: 45001,  max: 135000,   rate: 30 }, // Stage 3: 32.5% → 30%
+  { id: 4, min: 135001, max: 190000,   rate: 37 }, // Stage 3: threshold lifted from $180k
+  { id: 5, min: 190001, max: Infinity, rate: 45 }, // Stage 3: threshold lifted from $180k
+];
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+function calcIncomeTax(brackets) {
+  const sorted = [...brackets].sort((a, b) => a.min - b.min);
+  return INCOME_POOLS.reduce((total, pool) => {
+    if (!pool.incomeB) return total;
+    const mid = pool.max === Infinity
+      ? pool.min + 300000
+      : (pool.min + pool.max) / 2;
+    const b = sorted.find(b => mid >= b.min && (b.max === Infinity || mid <= b.max));
+    return b ? total + pool.incomeB * (b.rate / 100) : total;
+  }, 0);
+}
+
+function calcTaxForIncome(income, brackets) {
+  const sorted = [...brackets].sort((a, b) => a.min - b.min);
+  let tax = 0;
+  for (const b of sorted) {
+    if (income <= b.min) break;
+    const upper = b.max === Infinity ? income : Math.min(income, b.max);
+    const taxable = Math.max(0, upper - b.min);
+    tax += taxable * (b.rate / 100);
+  }
+  return tax;
+}
+
+function poolForBracket(bracket) {
+  return INCOME_POOLS.filter(p => {
+    if (!p.incomeB) return false;
+    const mid = p.max === Infinity ? p.min + 300000 : (p.min + p.max) / 2;
+    return mid >= bracket.min && (bracket.max === Infinity || mid <= bracket.max);
+  }).reduce((s, p) => s + p.incomeB, 0);
+}
+
+// Returns the Stage-4 default rate that would apply at this bracket's lower bound.
+// Used by BracketCard to show how the user's rate compares to baseline.
+function defaultRateForRange(min) {
+  for (const d of DEFAULT_BRACKETS) {
+    if (min >= d.min && (d.max === Infinity || min <= d.max)) return d.rate;
+  }
+  return 0;
+}
+
+// Fuel excise revenue with Fuel Tax Credits (FTC) interaction.
+// Net excise = gross excise − FTC payback (heavy vehicles, off-road business use).
+// FTC payback declines toward zero as rate approaches 20.6¢/L Road User Charge floor.
+function fuelImpactDelta(rate) {
+  const BASE_RATE   = 50.8;    // ¢/L petrol & diesel (2026-27 indexed)
+  const FTC_FLOOR   = 20.6;    // ¢/L RUC floor
+  const FUEL_BASE   = 0.520;   // $B per cent gross (~52GL eligible fuel)
+  const FTC_RATIO   = 0.40;    // FTC absorbs ~40% of marginal rate change above floor
+  const grossDelta  = (rate - BASE_RATE) * FUEL_BASE;
+  const ftcAtBase   = Math.max(0, BASE_RATE - FTC_FLOOR) * FUEL_BASE * FTC_RATIO;
+  const ftcAtRate   = Math.max(0, rate      - FTC_FLOOR) * FUEL_BASE * FTC_RATIO;
+  return grossDelta - (ftcAtRate - ftcAtBase);
+}
+
+const BASELINE_IT = calcIncomeTax(DEFAULT_BRACKETS); // used for delta only
+
+function fmt(n, sign = false) {
+  const abs = Math.abs(n);
+  const s = sign ? (n >= 0 ? "+" : "−") : n < 0 ? "−" : "";
+  if (abs >= 1000) return `${s}$${(abs / 1000).toFixed(1)}T`;
+  if (abs >= 0.05) return `${s}$${abs.toFixed(1)}B`;
+  return `${s}$${(abs * 1000).toFixed(0)}M`;
+}
+
+function grade(b) {
+  if (b >= 25)  return ["A+", "#7cb87a"];
+  if (b >= 10)  return ["A",  "#7cb87a"];
+  if (b >= 2)   return ["B+", "#94c592"];
+  if (b >= 0)   return ["B",  "#b0d4ae"];
+  if (b >= -10) return ["C",  "#d9b16c"];
+  if (b >= -25) return ["D",  "#d88c8c"];
+  return              ["F",  "#d97a7a"];
+}
+
+// ─── COMPONENTS ──────────────────────────────────────────────────────────────
+// ─── BUDGET BADGE ─────────────────────────────────────────────────────────────
+// Inline tag identifying a lever as an actual 2026-27 Budget policy.
+// Used when Phase 5 measures are embedded in their parent policy sections.
+function BudgetBadge({ superseded = false }) {
+  return superseded
+    ? <span style={{ background:"#3d3320", color:"#8a7040", fontSize:8, fontWeight:700,
+        borderRadius:3, padding:"1px 5px", marginLeft:6, border:"1px solid #6e5a30",
+        letterSpacing:"0.05em", verticalAlign:"middle", textDecoration:"line-through" }}>
+        2026-27 BUDGET — SUPERSEDED
+      </span>
+    : <span style={{ background:"#1e3d28", color:"#7cb87a", fontSize:8, fontWeight:700,
+        borderRadius:3, padding:"1px 5px", marginLeft:6, border:"1px solid #3a6e4a",
+        letterSpacing:"0.05em", verticalAlign:"middle" }}>
+        2026-27 BUDGET
+      </span>;
+}
+
+function Slider({ label, value, min, max, step, onChange, display, desc, note, color }) {
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 3 }}>
+        <span style={{ fontSize: 12, color: "#c0c4cd", fontWeight: 500, marginRight: 8 }}>{label}</span>
+        <span style={{ fontSize: 12, color: color || "#9bbef7", fontWeight: 700, whiteSpace: "nowrap" }}>{display(value)}</span>
+      </div>
+      {desc && <div style={{ fontSize: 10, color: "#6e7480", marginBottom: 4, lineHeight: 1.45 }}>{desc}</div>}
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e => onChange(parseFloat(e.target.value))}
+        style={{ width: "100%", accentColor: color || "#8fb4f0", cursor: "pointer" }} />
+      {note && <div style={{ fontSize: 10, color: "#565c66", marginTop: 1, lineHeight: 1.4 }}>{note}</div>}
+    </div>
+  );
+}
+
+// Toggle — boolean checkbox styled to match Slider's tone. Used throughout
+// Sec 15 (Commonwealth Investment Funds) for dissolution flags and proposed
+// fund establishment toggles. The `warn` prop highlights destructive toggles
+// (e.g. fund dissolutions) with an amber accent.
+function Toggle({ label, checked, onChange, desc, warn }) {
+  const id = `tg_${label.replace(/[^a-z0-9]/gi, '_').toLowerCase()}`;
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <label htmlFor={id} style={{ display: "flex", alignItems: "flex-start", cursor: "pointer", gap: 8 }}>
+        <input type="checkbox" id={id} checked={!!checked}
+          onChange={e => onChange(e.target.checked)}
+          style={{ marginTop: 3, accentColor: warn ? "#d88c8c" : "#8fb4f0", cursor: "pointer" }} />
+        <span style={{ flex: 1 }}>
+          <span style={{ fontSize: 12, color: checked ? (warn ? "#d88c8c" : "#9bbef7") : "#c0c4cd",
+            fontWeight: checked ? 700 : 500 }}>{label}</span>
+          {desc && <div style={{ fontSize: 10, color: "#6e7480", marginTop: 2, lineHeight: 1.45 }}>{desc}</div>}
+        </span>
+      </label>
+    </div>
+  );
+}
+
+function Sec({ title, sub, delta, deltaInv, children, init = false }) {
+  const globalCollapse = useContext(CollapseCtx);
+  const [open, setOpen] = useState(init);
+  // When a global expand/collapse signal arrives, sync internal state.
+  useEffect(() => {
+    if (globalCollapse === true)  setOpen(true);
+    if (globalCollapse === false) setOpen(false);
+  }, [globalCollapse]);
+
+  // Per-section delta colour: green = good for budget, red = bad for budget.
+  // For revenue sections (deltaInv=false), positive delta is good (more revenue).
+  // For spending sections (deltaInv=true), positive delta is bad (more spending).
+  const showDelta = delta !== undefined && Math.abs(delta) >= 0.05;
+  const isGood    = deltaInv ? delta < 0 : delta > 0;
+  const dColor    = isGood ? "#7cb87a" : "#d88c8c";
+  const dSign     = delta >= 0 ? "+" : "−";
+
+  return (
+    <div style={{ marginBottom: 5, borderRadius: 5, overflow: "hidden", border: "1px solid #4a4f59" }}>
+      <button onClick={() => setOpen(o => !o)} style={{
+        width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center",
+        padding: "9px 13px", background: "#30343c", border: "none", cursor: "pointer", textAlign: "left"
+      }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: "#9bbef7" }}>{title}</span>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
+          {showDelta && (
+            <span style={{ fontSize: 10, fontWeight: 700, color: dColor, fontVariantNumeric: "tabular-nums" }}>
+              {dSign}${Math.abs(delta).toFixed(1)}B
+            </span>
+          )}
+          {sub && <span style={{ fontSize: 10, color: "#7c828c" }}>{sub}</span>}
+          <span style={{ color: "#565c66", fontSize: 10 }}>{open ? "▲" : "▼"}</span>
+        </div>
+      </button>
+      {open && <div className="sec-body" style={{ padding: "13px 13px 4px", background: "#2a2d34" }}>{children}</div>}
+    </div>
+  );
+}
+
+// Card-based bracket presentation: replaces the older table view.
+// Shows range, current rate (editable), pool, tax revenue, mini bar gauge,
+// comparison vs Stage-4 default rate, and a remove control (non-first only).
+function BracketCard({ bracket, index, onRateChange, onRemove }) {
+  const pool       = poolForBracket(bracket);
+  const tax        = pool * bracket.rate / 100;
+  const defaultRt  = defaultRateForRange(bracket.min);
+  const delta      = bracket.rate - defaultRt;
+  const barPct     = Math.min(100, bracket.rate / 60 * 100); // gauge clipped at 60%
+  const rangeLabel = bracket.max === Infinity
+    ? `$${bracket.min.toLocaleString()}+`
+    : `$${bracket.min.toLocaleString()} – $${bracket.max.toLocaleString()}`;
+
+  return (
+    <div style={{
+      background: "#2d3139", border: "1px solid #4a4f59", borderRadius: 5, padding: "9px 11px 10px",
+      position: "relative", display: "flex", flexDirection: "column", gap: 6
+    }}>
+      {/* Top row: range + remove */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ fontSize: 10, color: "#8a909a", letterSpacing: "0.04em", whiteSpace: "nowrap" }}>
+          BRACKET {index + 1}
+        </span>
+        {index > 0 && (
+          <button onClick={() => onRemove(bracket.id)}
+            style={{ background: "#4a3030", color: "#d88c8c", border: "none", cursor: "pointer",
+              borderRadius: 3, padding: "1px 7px", fontSize: 10, fontFamily: "inherit", lineHeight: 1.2 }}>
+            ✕
+          </button>
+        )}
+      </div>
+
+      {/* Range */}
+      <div style={{ fontSize: 11, color: "#c0c4cd", fontWeight: 500 }}>{rangeLabel}</div>
+
+      {/* Rate row */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+          <input className="numinput" type="number" value={bracket.rate} min={0} max={90} step={0.5}
+            style={{ width: 56, fontSize: 16, fontWeight: 700, color: "#9bbef7", textAlign: "right" }}
+            onChange={e => onRateChange(bracket.id, e.target.value)} />
+          <span style={{ fontSize: 13, color: "#9bbef7", fontWeight: 700 }}>%</span>
+        </div>
+        <div style={{ textAlign: "right", fontSize: 9, color: "#6e7480", lineHeight: 1.3 }}>
+          {defaultRt > 0 || bracket.min > 0
+            ? <>
+                <div>Default: {defaultRt}%</div>
+                {Math.abs(delta) > 0.01 && (
+                  <div style={{ color: delta > 0 ? "#7cb87a" : "#d88c8c", fontWeight: 600 }}>
+                    {delta > 0 ? "↑" : "↓"} {Math.abs(delta).toFixed(1)}pp
+                  </div>
+                )}
+              </>
+            : <div>Tax-free</div>
+          }
+        </div>
+      </div>
+
+      {/* Mini rate gauge */}
+      <div style={{ height: 3, background: "#4a4f59", borderRadius: 2, overflow: "hidden" }}>
+        <div style={{
+          width: `${barPct}%`, height: "100%",
+          background: bracket.rate === 0 ? "#4a4f59"
+            : delta > 0 ? "#7cb87a" : delta < 0 ? "#d88c8c" : "#8fb4f0",
+          transition: "width 0.2s, background 0.2s"
+        }} />
+      </div>
+
+      {/* Bottom stats: pool & tax */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 2 }}>
+        <div>
+          <div style={{ fontSize: 9, color: "#7c828c", textTransform: "uppercase", letterSpacing: "0.05em" }}>Pool</div>
+          <div style={{ fontSize: 12, color: "#9da3ae", fontWeight: 500 }}>{pool > 0 ? `$${pool}B` : "—"}</div>
+        </div>
+        <div>
+          <div style={{ fontSize: 9, color: "#7c828c", textTransform: "uppercase", letterSpacing: "0.05em" }}>Tax</div>
+          <div style={{ fontSize: 12, color: "#9bbef7", fontWeight: 600 }}>{pool > 0 ? `$${tax.toFixed(1)}B` : "—"}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+export default function App() {
+
+  // Bracket state
+  const [brackets,  setBrackets]  = useState(DEFAULT_BRACKETS);
+  const [nextId,    setNextId]    = useState(10);
+  const [adding,    setAdding]    = useState(false);
+  const [thresh,    setThresh]    = useState("");
+  const [calcInc,   setCalcInc]   = useState(80000);
+  const [aiText,       setAiText]       = useState("");
+  const [aiLoading,    setAiLoading]    = useState(false);
+  // null = each Sec manages its own state; true = all open; false = all closed.
+  // Set to null after a tick so Sec sections can resume individual control.
+  const [globalExpand, setGlobalExpand] = useState(null);
+  // Transient feedback for the Copy Inputs button
+  const [copyFeedback, setCopyFeedback] = useState("");
+  // Paste-import UI state
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const [pasteFeedback, setPasteFeedback] = useState("");
+
+  // ── Revenue sliders ──────────────────────────────────────────────────────
+  const [medicare,    setMedicare]    = useState(2);
+  // Company tax — progressive brackets (replaces flat coLarge/coSmall sliders)
+  const [companyBrackets, setCompanyBrackets] = useState(DEFAULT_COMPANY_BRACKETS);
+  const [nextCompanyId,   setNextCompanyId]   = useState(7);
+  // GST levers
+  const [gstRate,     setGstRate]     = useState(10);
+  const [gstBase,     setGstBase]     = useState(false); // (legacy bulk-expand; retained for back-compat)
+  const [gstRetain,   setGstRetain]   = useState(0);
+  // GST exemption removal — currently GST-free / input-taxed categories under
+  // A New Tax System (Goods and Services Tax) Act 1999 (Cth). Ticking subjects
+  // the category to 10% GST. Per Federal Financial Relations Act 2009 (Cth)
+  // additional collections flow through the GST retention lever.
+  const [gstExFood,        setGstExFood]        = useState(false); // Fresh basic food (s38-2 GSTA 1999)
+  const [gstExHealth,      setGstExHealth]      = useState(false); // Health services (Subdivision 38-B)
+  const [gstExEducation,   setGstExEducation]   = useState(false); // Education services (Subdivision 38-C)
+  const [gstExChildcare,   setGstExChildcare]   = useState(false); // Childcare services (Subdivision 38-D)
+  const [gstExReligious,   setGstExReligious]   = useState(false); // Religious services
+  const [gstExCharity,     setGstExCharity]     = useState(false); // Non-commercial charity activities (Subdivision 38-G)
+  const [gstExRentRes,     setGstExRentRes]     = useState(false); // Residential rent (input taxed Div 40)
+  const [gstExFinancial,   setGstExFinancial]   = useState(false); // Financial supplies (input taxed Div 40)
+  const [gstExWaterSewer,  setGstExWaterSewer]  = useState(false); // Water, sewerage, drainage (s38-285)
+  const [gstExPrecMetals,  setGstExPrecMetals]  = useState(false); // Precious metals (Subdivision 38-L)
+  const [superEarn,   setSuperEarn]   = useState(15);
+  const [superConc,   setSuperConc]   = useState(15);
+  const [superHB,     setSuperHB]     = useState(30);   // Div 296 now in effect
+  const [cgtDisc,     setCgtDisc]     = useState(50);
+  const [primRes,     setPrimRes]     = useState(0);
+  const [negGear,     setNegGear]     = useState(0);
+  const [fuel,        setFuel]        = useState(50.8); // Updated: indexed rate 2026-27
+  const [evRUC,       setEvRUC]       = useState(0);
+  const [tobacco,     setTobacco]     = useState(1.75);
+  const [alcohol,     setAlcohol]     = useState(0.70);
+  const [prrt,        setPrrt]        = useState(40);
+  const [minLevy,     setMinLevy]     = useState(0);
+  const [lngLevy,     setLngLevy]     = useState(0);
+  const [fbtRate,     setFbtRate]     = useState(47);
+  const [fbtExempt,   setFbtExempt]   = useState(0);
+  const [lvt,         setLvt]         = useState(0);
+  const [carbon,      setCarbon]      = useState(0);
+  const [estate,      setEstate]      = useState(0);
+  const [wealth,      setWealth]      = useState(0);
+  const [finTax,      setFinTax]      = useState(0);
+  const [customs,     setCustoms]     = useState(0);
+  const [luxCar,      setLuxCar]      = useState(33);
+  const [wineEq,      setWineEq]      = useState(29);
+
+  // ── Spending sliders ─────────────────────────────────────────────────────
+  const [pensRate,    setPensRate]    = useState(1150);
+  const [pensAge,     setPensAge]     = useState(67);
+  const [pensAsset,   setPensAsset]   = useState(700);
+  const [jsRate,      setJsRate]      = useState(810);
+  const [jsCutout,    setJsCutout]    = useState(1390);
+  const [dspRate,     setDspRate]     = useState(1150);
+  const [dspPts,      setDspPts]      = useState(20);
+  const [ftbA,        setFtbA]        = useState(195);
+  const [ftbB,        setFtbB]        = useState(170);
+  const [childcare,   setChildcare]   = useState(58);
+  const [gpBulk,      setGpBulk]      = useState(91);   // Up from 88% after Tripling Bulk Billing
+  const [gpRebate,    setGpRebate]    = useState(44);
+  const [hospital,    setHospital]    = useState(37.4); // NHRA hospital funding to states (BP3)
+  const [pbs,         setPbs]         = useState(31.60);
+  const [acdc,        setAcdc]        = useState(0.2);  // NEW: ACDC funding ($B)
+  const [ndisP,       setNdisP]       = useState(720);  // Updated: post-reform participants
+  const [ndisCost,    setNdisCost]    = useState(78);   // Updated: average cost
+  const [inHome,      setInHome]      = useState(22000);
+  const [resCare,     setResCare]     = useState(70);
+  const [eduPerStu,   setEduPerStu]   = useState(7800);
+  const [uniRes,      setUniRes]      = useState(10.5);
+  const [uniSub,      setUniSub]      = useState(45);
+  const [regHigherEd, setRegHigherEd] = useState(0);    // NEW: regional/equity loading
+  const [defence,     setDefence]     = useState(2.02); // 2026-27 actual
+  const [roadRail,    setRoadRail]    = useState(15.3); // Post slippage adjustment
+  const [otherInfra,  setOtherInfra]  = useState(8);
+  const [aps,         setAps]         = useState(217);  // 217,256 civilian ASL
+  const [apsWage,     setApsWage]     = useState(0);
+  const [capInv,      setCapInv]      = useState(8);
+  const [envProg,     setEnvProg]     = useState(7);
+  const [vets,        setVets]        = useState(12.2);
+  const [aid,         setAid]         = useState(5.1);
+  const [housingP,    setHousingP]    = useState(11.4); // Up: HAFF ramp-up, LIF, Help to Buy
+  const [indig,       setIndig]       = useState(6);
+  const [agri,        setAgri]        = useState(5);
+  const [immig,       setImmig]       = useState(5);
+  const [arts,        setArts]        = useState(2);
+
+  // ── Phase 5: 2026-27 Budget measures (effective dates apply in forward years) ─
+  // Tax-side measures
+  const [wato,        setWato]        = useState(0);    // Working Australian Tax Offset $/yr (0=off, default $250 in 2027-28+)
+  const [negGearNew,  setNegGearNew]  = useState(false);// Negative gearing restricted to new builds (eff. 1 July 2027)
+  const [cgtMinTax,   setCgtMinTax]   = useState(false);// CGT indexation + 30% effective minimum (eff. 1 July 2027)
+  // Trust min-tax MOVED to dedicated Trust Taxation section as adjustable rate (trustMinTaxRate)
+  const [phiReform,   setPhiReform]   = useState(false);// Modernising PHI: remove age-based rebate uplift
+  const [lossCarry,   setLossCarry]   = useState(false);// Small co. loss carry-back (eff. 2026-27 income year)
+  const [iawo,        setIawo]        = useState(true); // $20k instant asset write-off made permanent
+  const [pmc,         setPmc]         = useState(70);   // Passenger Movement Charge ($/passenger; current ~$70)
+  const [gasReserve,  setGasReserve]  = useState(0);    // Domestic gas reservation % of LNG exports
+  // Spending-side measures
+  const [thrivingKids,    setThrivingKids]    = useState(0);  // Cth contribution to Thriving Kids ($B; budget allocates ~$0.5B 2026-27 rising)
+  const [foundSupports,   setFoundSupports]   = useState(0.28);// National Foundational Supports ($B/yr)
+  const [localInfraFund,  setLocalInfraFund]  = useState(0.26);// Local Infrastructure Fund ($B/yr 2026-27)
+  const [helpToBuyExt,    setHelpToBuyExt]    = useState(1.6); // Help to Buy expansion ($B 2026-27)
+  // Higher-education additions
+  const [helpIndexation,  setHelpIndexation]  = useState(4.0); // HECS-HELP indexation rate (% per annum; default ~CPI)
+  // SA-specific items (consolidated)
+  // State & Territory-specific Commonwealth commitments — major identified projects
+  // Baselines from BP3 2026-27 (Federal Financial Relations) and BP2 (specific measures).
+  // Stored as $B/yr values; default = current Budget allocation. All adjustable.
+  const [saWhyalla,       setSaWhyalla]       = useState(0.121); // SA: Whyalla support ($121M 2026-27)
+  const [saHMRB,          setSaHMRB]          = useState(0.012); // SA: HMRB loan interest ($12.4M)
+  const [saNorthernWater, setSaNorthernWater] = useState(0.060); // SA: Northern Water Supply Project ($60M/yr Cth share)
+  const [nswWSALink,      setNswWSALink]      = useState(0.350); // NSW: Western Sydney Airport rail ($350M/yr avg)
+  const [nswHumeLink,     setNswHumeLink]     = useState(0.240); // NSW: HumeLink transmission Cth contribution
+  const [nswM12,          setNswM12]          = useState(0.080); // NSW: M12 Motorway Cth share
+  const [vicSRL,          setVicSRL]          = useState(2.200); // VIC: SRL East — Cth committed $2.2B
+  const [vicGeelongRail,  setVicGeelongRail]  = useState(0.180); // VIC: Geelong Fast Rail planning + early works
+  const [vicYarraRecovery,setVicYarraRecovery]= useState(0.040); // VIC: Yarra River recovery / urban cooling
+  const [qldBruceHwy,     setQldBruceHwy]     = useState(0.700); // QLD: Bruce Highway annual Cth contribution
+  const [qldOlympics,     setQldOlympics]     = useState(0.300); // QLD: Brisbane 2032 venue & infrastructure
+  const [qldCopperString, setQldCopperString] = useState(0.110); // QLD: CopperString transmission
+  const [waWestport,      setWaWestport]      = useState(0.080); // WA: Westport (Kwinana port) Cth share
+  const [waMetronet,      setWaMetronet]      = useState(0.260); // WA: METRONET extensions
+  const [waPilbaraEnergy, setWaPilbaraEnergy] = useState(0.080); // WA: Pilbara energy transition fund
+  const [tasMacqPoint,    setTasMacqPoint]    = useState(0.240); // TAS: Macquarie Point AFL stadium / precinct ($240M Cth)
+  const [tasBridge,       setTasBridge]       = useState(0.300); // TAS: Tasman Bridge / Bridgewater Bridge replacement
+  const [tasFreightEq,    setTasFreightEq]    = useState(0.165); // TAS: Tasmanian Freight Equalisation Scheme ($165M baseline)
+  const [ntMiddleArm,     setNtMiddleArm]     = useState(0.300); // NT: Middle Arm sustainable development precinct
+  const [ntDefenceDual,   setNtDefenceDual]   = useState(0.220); // NT: Defence dual-use infrastructure (Tindal, Darwin)
+  const [actLightRail,    setActLightRail]    = useState(0.044); // ACT: Stage 2A light rail Cth contribution
+  const [actNatInst,      setActNatInst]      = useState(0.180); // ACT: National institutions baseline uplift (AWM, NLA, NGA)
+
+  // ── New revenue levers (Phase 8 expansion) ───────────────────────────────
+  // Environmental & health excises
+  const [plasticExcise,   setPlasticExcise]   = useState(0);     // $/kg of plastic packaging (0-3)
+  const [sugarLevy,       setSugarLevy]       = useState(0);     // % on sugar-sweetened beverages & high-sugar processed foods (0-30)
+  // Digital & monopoly
+  const [digitalSvc,      setDigitalSvc]      = useState(0);     // % on Australian revenue of major digital platforms (0-10)
+  const [monopolyLevy,    setMonopolyLevy]    = useState(0);     // % on excess profits in concentrated markets (0-30)
+  // Fuel section additions
+  const [hvRUC,           setHvRUC]           = useState(20.6);  // Heavy vehicle RUC c/L (currently 20.6¢)
+  const [hvEvDiscount,    setHvEvDiscount]    = useState(100);   // EV heavy vehicle discount % vs equivalent per-km charge (100% = exempt)
+  const [evSurcharge,     setEvSurcharge]     = useState(0);     // EV registration surcharge $/yr
+  // FBT — three existing toggles plus expanded set below
+  const [fbtEV,           setFbtEV]           = useState(true);
+  const [fbtNovated,      setFbtNovated]      = useState(true);
+  const [fbtRemote,       setFbtRemote]       = useState(true);
+  const [fbtEntertainment,setFbtEntertainment]= useState(true);  // Entertainment / minor benefits exemption (FBTAA s58P)
+  const [fbtParking,      setFbtParking]      = useState(true);  // Car parking exemption (FBTAA s58G; small business)
+  const [fbtChildcareWP,  setFbtChildcareWP]  = useState(true);  // Work-provided childcare (FBTAA s47(2))
+  const [fbtLaptops,      setFbtLaptops]      = useState(true);  // Laptops & portable devices (FBTAA s58X)
+  const [fbtLAFHA,        setFbtLAFHA]        = useState(true);  // Living-away-from-home allowance
+  const [fbtRelocation,   setFbtRelocation]   = useState(true);  // Relocation benefits (FBTAA Div 13A)
+  const [fbtPBI,          setFbtPBI]          = useState(true);  // Public benevolent institution / FBT cap (currently $30,000)
+  const [fbtReligious,    setFbtReligious]    = useState(true);  // Religious institutions exemption (FBTAA s57)
+  // Trust taxation — dedicated section state
+  const [trustMinTaxRate, setTrustMinTaxRate] = useState(0);     // 30% discretionary trust minimum tax (was Phase 5 toggle; now adjustable rate 0-45%)
+  const [trustBucketCo,   setTrustBucketCo]   = useState(false); // Restrict distributions to bucket companies
+  const [trustS99B,       setTrustS99B]       = useState(false); // Tighten ITAA 1936 s99B foreign trust treatment
+  const [trustLossRecoup, setTrustLossRecoup] = useState(false); // Tighten trust loss recoupment rules (Schedule 2F)
+  const [trustFTE,        setTrustFTE]        = useState(false); // Tighten Family Trust Election restrictions
+  const [trustStreaming,  setTrustStreaming]  = useState(false); // Tighten capital gain / franked dividend streaming
+  const [trustCgtDisc,    setTrustCgtDisc]    = useState(false); // Remove CGT discount for trusts (currently 50%)
+  // Nationalisation by industry — % Commonwealth ownership (just-terms acquisition under s.51(xxxi))
+  const [natLNG,          setNatLNG]          = useState(0);
+  const [natIronOre,      setNatIronOre]      = useState(0);
+  const [natCoalGen,      setNatCoalGen]      = useState(0);
+  const [natBanking,      setNatBanking]      = useState(0);
+  // Expanded environmental & health excises
+  const [singleUsePlastic,setSingleUsePlastic]= useState(0);     // $/item levy on single-use plastic items (0-1)
+  const [eWasteLevy,      setEWasteLevy]      = useState(0);     // $/device levy on consumer electronics (0-50)
+  const [tyreLevy,        setTyreLevy]        = useState(0);     // $/tyre at sale (0-10)
+  const [gamblingLevy,    setGamblingLevy]    = useState(0);     // % on online wagering turnover (0-25)
+  const [vapesExcise,     setVapesExcise]     = useState(0);     // $/mL on e-cigarette liquid (0-2)
+  const [alcoholHealth,   setAlcoholHealth]   = useState(0);     // additional public health levy % on alcohol excise (0-50)
+  const [airEmissions,    setAirEmissions]    = useState(0);     // $/tonne CO₂e on domestic + departing aviation (0-100)
+  const [batteryLevy,     setBatteryLevy]     = useState(0);     // $/kWh on lithium battery sales for recycling fund (0-15)
+
+  // ── Missing taxation areas (Phase 10) ────────────────────────────────────
+  // Fuel Tax Credits — currently ~$10.7B/yr cost to revenue; a tax expenditure
+  // on diesel used in off-road mining/agriculture/heavy industry under the
+  // Fuel Tax Act 2006 (Cth). Reducing the credit rate reduces the expenditure.
+  const [ftcRate,         setFtcRate]         = useState(100);   // FTC credit rate as % of fuel excise (100% = current law)
+  const [ftcMining,       setFtcMining]       = useState(true);  // Mining sector eligible (uncheck to remove)
+  const [ftcAg,           setFtcAg]           = useState(true);  // Agriculture sector eligible
+  // Medicare Levy Surcharge — applied to high-income earners without private
+  // hospital cover under the A New Tax Policy (Medicare Levy Surcharge) Act 1999 (Cth).
+  const [mlsThreshold,    setMlsThreshold]    = useState(93000); // Income threshold for MLS ($; currently $93,000)
+  const [mlsRate,         setMlsRate]         = useState(1.0);   // MLS rate at lowest tier % (1.0–1.5%)
+  // Withholding taxes — Div 11A ITAA 1936; rates set by tax treaties / ITAA 1997 s.128B
+  const [withholdDiv,     setWithholdDiv]     = useState(30);    // Dividend withholding % (non-treaty non-residents; currently 30%)
+  const [withholdInt,     setWithholdInt]     = useState(10);    // Interest withholding % (currently 10%)
+  const [withholdRoy,     setWithholdRoy]     = useState(30);    // Royalty withholding % (currently 30%)
+  // Division 293 — additional 15% tax on super contributions for income >$250k
+  // Treasury Laws Amendment (More Flexible Superannuation) 2020; ~80,000 affected
+  const [div293Thresh,    setDiv293Thresh]    = useState(250);   // Div 293 threshold ($k; currently $250k)
+  // PAYG withholding / PAYGW — largely self-calibrating; lever here is the
+  // variation rate / instalment rate applied to investment income
+  const [paygInstalment,  setPaygInstalment]  = useState(0);     // Additional PAYG instalment variation % (0 = no change)
+  // R&D Tax Incentive — Treasury Laws Amendment (R&D Tax Incentive) Act 2020 (Cth)
+  // ~$3.5B/yr tax expenditure. 43.5% refundable offset (turnover <$20M); 33.5% non-refundable (large)
+  const [rdIncentive,     setRdIncentive]     = useState(43.5);  // Refundable R&D offset rate % (<$20M turnover; currently 43.5%)
+  // Thin capitalisation (debt deduction rules) — Tax Laws Amendment (Thin
+  // Capitalisation) Act 2023 (Cth); arm's length debt test; affects MNE interest deductions
+  const [thinCap,         setThinCap]         = useState(false); // Tighten further beyond 2023 reforms (+$0.4B)
+  // LITO / LMITO — low-income tax offset; LMITO ended 2022-23; LITO currently $700 max
+  const [litoMax,         setLitoMax]         = useState(700);   // LITO maximum offset ($; currently $700)
+
+  // ── Commonwealth Government Business Enterprises (Phase 10) ─────────────
+  // Each lever models dividend policy, efficiency target, or ownership change.
+  // Sources: Finance portfolio entity budget statements; PGPA Act 2013 (Cth).
+  const [gbeAusPost,      setGbeAusPost]      = useState(0);     // Additional dividend from Australia Post ($M above baseline ~$200M/yr)
+  const [gbeNBN,          setGbeNBN]          = useState(0);     // NBN Co efficiency dividend / partial privatisation ($M; currently govt-owned, paying back debt)
+  const [gbeSnowyHydro,   setGbeSnowyHydro]   = useState(0);     // Snowy Hydro dividend uplift ($M above baseline ~$250M/yr)
+  const [gbeAssetSales,   setGbeAssetSales]   = useState(0);     // Asset recycling / partial privatisation proceeds ($B one-off, amortised 10yr)
+  const [gbeNewCorp,      setGbeNewCorp]      = useState(false); // Create new Commonwealth development bank / strategic investment vehicle
+  const [gbeNewCorpSize,  setGbeNewCorpSize]  = useState(5);     // Capitalisation of new Commonwealth corporation ($B)
+  const [gbeNewCorpYield, setGbeNewCorpYield] = useState(6);     // Target annual return on new corporation (%)
+
+  // Additional existing GBEs — dividend uplift ($M above their current baseline)
+  const [gbeDefHousing,   setGbeDefHousing]   = useState(0);     // Defence Housing Australia — additional dividend ($M; baseline ~$100M/yr)
+  const [gbeAnsto,        setGbeAnsto]        = useState(0);     // Australian Nuclear Science and Technology Organisation commercial arm ($M)
+  const [gbeAirservices,  setGbeAirservices]  = useState(0);     // Airservices Australia — additional dividend ($M; baseline ~$130M/yr)
+  const [gbeMint,         setGbeMint]         = useState(0);     // Royal Australian Mint — additional dividend ($M; baseline ~$30M/yr)
+  const [gbeAusTrade,     setGbeAusTrade]     = useState(0);     // Australian Trade and Investment Commission commercial operations ($M)
+
+  // Re-acquisition of privatised government assets
+  // These were once Commonwealth or state government owned and are now wholly or mostly private.
+  // Modelled as: Commonwealth purchases % stake at current market price; annual dividend/return flow
+  // shown as revenue; annual interest on acquisition debt shown as spending.
+  // Constitutional basis: s.51(xxxi) just-terms acquisition OR voluntary purchase (no constitutional constraint).
+  const [reAcqTelstra,    setReAcqTelstra]    = useState(0);     // Telstra (privatised 1997-2006) — Cth stake % (currently 0%)
+  const [reAcqAirports,   setReAcqAirports]   = useState(0);     // Major privatised airports (Sydney, Melbourne, Brisbane) — Cth stake %
+  const [reAcqPorts,      setReAcqPorts]      = useState(0);     // Major privatised ports (Port of Melbourne, Port Botany) — Cth stake %
+  const [reAcqCommsBank,  setReAcqCommsBank]  = useState(0);     // Commonwealth Bank (privatised 1991-1996) — Cth stake % buyback
+
+  // Individual new proposed Commonwealth corporations (distinct from the generic gbeNewCorp above)
+  // Each modelled separately so users can mix and match rather than modelling one aggregate vehicle.
+  const [gbeHousingCorp,  setGbeHousingCorp]  = useState(false); // Commonwealth Housing Finance Corporation ($B)
+  const [gbeHousingCapB,  setGbeHousingCapB]  = useState(10);    // CHFC capitalisation ($B)
+  const [gbeMfgCorp,      setGbeMfgCorp]      = useState(false); // Australian Strategic Manufacturing Corporation
+  const [gbeMfgCapB,      setGbeMfgCapB]      = useState(10);    // ASMC capitalisation ($B)
+  const [gbeCritMin,      setGbeCritMin]      = useState(false); // Australian Critical Minerals Investment Corporation
+  const [gbeCritMinCapB,  setGbeCritMinCapB]  = useState(5);     // ACMIC capitalisation ($B)
+  const [gbeRegBank,      setGbeRegBank]      = useState(false); // Commonwealth Development Bank (regional/SME)
+  const [gbeRegBankCapB,  setGbeRegBankCapB]  = useState(8);     // CDB capitalisation ($B)
+  const [gbeRewiringCorp, setGbeRewiringCorp] = useState(false); // Rewiring Australia Corporation (transmission)
+  const [gbeRewiringCapB, setGbeRewiringCapB] = useState(8);     // RAC capitalisation ($B)
+  const [gbeFirstNations, setGbeFirstNations] = useState(false); // First Nations Wealth Fund
+  const [gbeFirstNatCapB, setGbeFirstNatCapB] = useState(6);     // FNF capitalisation ($B)
+
+  // ── New spending levers (Phase 8 expansion) ──────────────────────────────
+  // Youth & student supports
+  const [youthAllow,      setYouthAllow]      = useState(640);   // Youth Allowance rate $/fn (single, away from home ~$640)
+  const [austudy,         setAustudy]         = useState(700);   // Austudy/ABSTUDY rate $/fn
+  // Health expansion
+  const [dentalVision,    setDentalVision]    = useState(0);     // Universal dental & vision ($B/yr; baseline $0 except limited schemes)
+  const [mentalHealth,    setMentalHealth]    = useState(7.4);   // Mental health funding ($B/yr; current ~$7.4B)
+  const [indigHealth,     setIndigHealth]     = useState(4.3);   // Indigenous health specifically ($B/yr)
+  // Research expansion (splitting old uniRes)
+  const [csiroFund,       setCsiroFund]       = useState(1.0);   // CSIRO appropriation ($B/yr)
+  const [nhmrcFund,       setNhmrcFund]       = useState(1.2);   // NHMRC grants ($B/yr)
+  const [arcFund,         setArcFund]         = useState(0.8);   // ARC grants ($B/yr) — replaces general uniRes for split modelling
+  // VET / TAFE
+  const [vetTafe,         setVetTafe]         = useState(2.6);   // National Skills Agreement Cth contribution ($B/yr)
+  // Federal policing & borders
+  const [afp,             setAfp]             = useState(2.4);   // AFP appropriation ($B/yr)
+  const [borderForce,     setBorderForce]     = useState(2.8);   // ABF separate from general Home Affairs admin
+  // Early childhood
+  const [earlyChild,      setEarlyChild]      = useState(2.0);   // Early childhood education programs ($B/yr)
+
+  // ── Commonwealth Investment Funds (Phase 13) ─────────────────────────────
+  // Levers per fund:
+  //   *Contrib       — additional capital contribution this year ($B; spending)
+  //   *TargetReturn  — investment mandate target return (%; forward estimates only)
+  //   *DisburseAdj   — additional disbursement vs baseline ($B; spending)
+  //   *SalePct       — % of fund sold to private sector (one-off Year-1 revenue)
+  //   *Dissolve      — bool; if true, fund is fully wound up (revenue = AUM)
+
+  // 1. Future Fund (Future Fund Act 2006)
+  const [ffContrib,       setFfContrib]       = useState(0);     // Additional capital injection ($B/yr)
+  const [ffTargetReturn,  setFfTargetReturn]  = useState(4.5);   // Mandate CPI+4-5% (midpoint 4.5%)
+  const [ffSalePct,       setFfSalePct]       = useState(0);     // % of Future Fund liquidated
+  const [ffDissolve,      setFfDissolve]      = useState(false); // Full dissolution flag
+  const [ffEarlyDraw,     setFfEarlyDraw]     = useState(0);     // Early drawdown for UCB ($B/yr)
+
+  // 2. Medical Research Future Fund (MRFF Act 2015)
+  const [mrffContrib,     setMrffContrib]     = useState(0);     // Additional contribution ($B/yr)
+  const [mrffDisburseAdj, setMrffDisburseAdj] = useState(0);     // Disbursement uplift vs $650M baseline
+  const [mrffSalePct,     setMrffSalePct]     = useState(0);
+  const [mrffDissolve,    setMrffDissolve]    = useState(false);
+
+  // 3. DisabilityCare Australia Fund (DCAF Act 2013)
+  const [dcafContrib,     setDcafContrib]     = useState(0);
+  const [dcafDisburseAdj, setDcafDisburseAdj] = useState(0);     // Disbursement uplift to NDIS funding
+  const [dcafSalePct,     setDcafSalePct]     = useState(0);
+  const [dcafDissolve,    setDcafDissolve]    = useState(false);
+
+  // 4. Aboriginal and Torres Strait Islander Land and Sea Future Fund
+  const [atsilsffContrib,     setAtsilsffContrib]     = useState(0);
+  const [atsilsffDisburseAdj, setAtsilsffDisburseAdj] = useState(0);
+  const [atsilsffSalePct,     setAtsilsffSalePct]     = useState(0);
+  const [atsilsffDissolve,    setAtsilsffDissolve]    = useState(false);
+
+  // 5. Future Drought Fund (Future Drought Fund Act 2019)
+  const [fdfContrib,      setFdfContrib]      = useState(0);
+  const [fdfDisburseAdj,  setFdfDisburseAdj]  = useState(0);     // Up to $100M/yr baseline draw
+  const [fdfSalePct,      setFdfSalePct]      = useState(0);
+  const [fdfDissolve,     setFdfDissolve]     = useState(false);
+
+  // 6. Disaster Ready Fund (was Emergency Response Fund 2019, repurposed 2023)
+  const [drfContrib,      setDrfContrib]      = useState(0);
+  const [drfDisburseAdj,  setDrfDisburseAdj]  = useState(0);     // Up to $200M/yr baseline
+  const [drfSalePct,      setDrfSalePct]      = useState(0);
+  const [drfDissolve,     setDrfDissolve]     = useState(false);
+
+  // 7. Housing Australia Future Fund (HAFF Act 2023)
+  const [haffContrib,     setHaffContrib]     = useState(0);
+  const [haffDisburseAdj, setHaffDisburseAdj] = useState(0);     // $500M/yr baseline → housingP
+  const [haffSalePct,     setHaffSalePct]     = useState(0);
+  const [haffDissolve,    setHaffDissolve]    = useState(false);
+
+  // 8. Clean Energy Finance Corporation (CEFC Act 2012; separate corp, not FFBoG)
+  const [cefcContrib,     setCefcContrib]     = useState(0);     // New capital allocation ($B)
+  const [cefcTargetReturn, setCefcTargetReturn] = useState(4.5); // Currently 5-yr govt bond + 2-3%
+  const [cefcSalePct,     setCefcSalePct]     = useState(0);     // Coalition policy 2014: full abolition
+  const [cefcDissolve,    setCefcDissolve]    = useState(false);
+
+  // 9. National Reconstruction Fund Corporation (NRFC Act 2023; separate corp)
+  const [nrfcContrib,     setNrfcContrib]     = useState(0);     // Top-up beyond current $15B commitment
+  const [nrfcTargetReturn, setNrfcTargetReturn] = useState(5.5); // 5-yr bond + 2-3% (Net Zero sub-fund -1%)
+  const [nrfcSalePct,     setNrfcSalePct]     = useState(0);
+  const [nrfcDissolve,    setNrfcDissolve]    = useState(false);
+
+  // ── New proposed funds (off by default) ──────────────────────────────────
+  // Proposals from various policy traditions for additional sovereign funds.
+  const [newSoverFund,      setNewSoverFund]      = useState(false); // Sovereign Wealth Fund (Norwegian model: resource rents)
+  const [newSoverFundCapB,  setNewSoverFundCapB]  = useState(20);    // Initial capitalisation ($B)
+  const [newSoverFundContribAnnual, setNewSoverFundContribAnnual] = useState(5); // Annual top-up from resource rents
+  const [newGenFund,        setNewGenFund]        = useState(false); // Future Generations Fund (intergenerational equity)
+  const [newGenFundCapB,    setNewGenFundCapB]    = useState(15);
+  const [newInfraFund,      setNewInfraFund]      = useState(false); // National Infrastructure Investment Fund
+  const [newInfraFundCapB,  setNewInfraFundCapB]  = useState(25);
+  const [newDefenceFund,    setNewDefenceFund]    = useState(false); // Defence Industry Investment Fund (post-AUKUS)
+  const [newDefenceFundCapB, setNewDefenceFundCapB] = useState(10);
+
+  // ── Bracket operations ───────────────────────────────────────────────────
+  const addBracket = useCallback(() => {
+    const t = Math.round(parseFloat(thresh.replace(/,/g, "")));
+    if (!t || t <= 0) return;
+    const sorted = [...brackets].sort((a, b) => a.min - b.min);
+    const idx = sorted.findIndex(b => t > b.min && (b.max === Infinity || t < b.max));
+    if (idx === -1) return;
+    const target = sorted[idx];
+    const id = nextId;
+    const result = sorted.flatMap((b, i) =>
+      i !== idx ? [b] : [
+        { ...b, max: t },
+        { id, min: t + 1, max: target.max, rate: target.rate }
+      ]
+    );
+    setBrackets(result);
+    setNextId(n => n + 1);
+    setThresh("");
+    setAdding(false);
+  }, [brackets, thresh, nextId]);
+
+  const removeBracket = useCallback((id) => {
+    if (brackets.length <= 2) return;
+    const sorted = [...brackets].sort((a, b) => a.min - b.min);
+    const idx = sorted.findIndex(b => b.id === id);
+    if (idx <= 0) return;
+    const prev = { ...sorted[idx - 1], max: sorted[idx].max };
+    setBrackets(sorted.filter(b => b.id !== id).map(b => b.id === prev.id ? prev : b));
+  }, [brackets]);
+
+  const updateRate = useCallback((id, val) => {
+    const r = Math.max(0, Math.min(90, parseFloat(val) || 0));
+    setBrackets(prev => prev.map(b => b.id === id ? { ...b, rate: r } : b));
+  }, []);
+
+  // Company tax bracket helpers (mirror income tax bracket logic).
+  const [companyThresh, setCompanyThresh] = useState("");
+  const [addingCompany, setAddingCompany] = useState(false);
+
+  const addCompanyBracket = useCallback(() => {
+    const t = Math.round(parseFloat(companyThresh.replace(/,/g, "")));
+    if (!t || t <= 0) return;
+    const sorted = [...companyBrackets].sort((a, b) => a.min - b.min);
+    const idx = sorted.findIndex(b => t > b.min && (b.max === Infinity || t < b.max));
+    if (idx === -1) return;
+    const target = sorted[idx];
+    const id = nextCompanyId;
+    const result = sorted.flatMap((b, i) =>
+      i !== idx ? [b] : [
+        { ...b, max: t },
+        { id, min: t + 1, max: target.max, rate: target.rate }
+      ]
+    );
+    setCompanyBrackets(result);
+    setNextCompanyId(n => n + 1);
+    setCompanyThresh("");
+    setAddingCompany(false);
+  }, [companyBrackets, companyThresh, nextCompanyId]);
+
+  const removeCompanyBracket = useCallback((id) => {
+    if (companyBrackets.length <= 2) return;
+    const sorted = [...companyBrackets].sort((a, b) => a.min - b.min);
+    const idx = sorted.findIndex(b => b.id === id);
+    if (idx <= 0) return;
+    const prev = { ...sorted[idx - 1], max: sorted[idx].max };
+    setCompanyBrackets(sorted.filter(b => b.id !== id).map(b => b.id === prev.id ? prev : b));
+  }, [companyBrackets]);
+
+  const updateCompanyRate = useCallback((id, val) => {
+    const r = Math.max(0, Math.min(90, parseFloat(val) || 0));
+    setCompanyBrackets(prev => prev.map(b => b.id === id ? { ...b, rate: r } : b));
+  }, []);
+
+  // ── Export / Import scenario as JSON ─────────────────────────────────────
+  // Round-trips the full state of the simulator so reform packages can be
+  // saved, shared, and reloaded. No persistent storage — file-based only.
+  const importInputRef = useRef(null);
+
+  // ── Canonical scenario builder ─────────────────────────────────────────────
+  // Single source of truth for serialised state. Used by exportSettings (file
+  // download), copyInputs (embedded re-import block in clipboard text), and
+  // the autosave useEffect. Centralising here means new state variables only
+  // need to be added in ONE place to be persisted across all three paths.
+  const buildScenario = () => ({
+    schema: "aus-budget-sim",
+    schemaVersion: 1,
+    baselineYear: "2026-27",
+    brackets,
+    nextId,
+    revenue: {
+      medicare, companyBrackets, nextCompanyId, gstRate, gstBase, gstRetain,
+      gstExFood, gstExHealth, gstExEducation, gstExChildcare, gstExReligious,
+      gstExCharity, gstExRentRes, gstExFinancial, gstExWaterSewer, gstExPrecMetals,
+      superEarn, superConc, superHB, cgtDisc, primRes, negGear,
+      fuel, evRUC, evSurcharge, hvRUC, hvEvDiscount,
+      tobacco, alcohol, prrt, minLevy, lngLevy,
+      fbtRate, fbtExempt, fbtEV, fbtNovated, fbtRemote,
+      fbtEntertainment, fbtParking, fbtChildcareWP, fbtLaptops,
+      fbtLAFHA, fbtRelocation, fbtPBI, fbtReligious,
+      trustMinTaxRate, trustBucketCo, trustS99B, trustLossRecoup,
+      trustFTE, trustStreaming, trustCgtDisc,
+      lvt, carbon, estate, wealth, finTax,
+      customs, luxCar, wineEq,
+      plasticExcise, sugarLevy, digitalSvc, monopolyLevy,
+      singleUsePlastic, eWasteLevy, tyreLevy, gamblingLevy, vapesExcise,
+      alcoholHealth, airEmissions, batteryLevy,
+      natLNG, natIronOre, natCoalGen, natBanking,
+      ftcRate, ftcMining, ftcAg, mlsThreshold, mlsRate,
+      withholdDiv, withholdInt, withholdRoy, div293Thresh, paygInstalment,
+      rdIncentive, thinCap, litoMax,
+      gbeAusPost, gbeNBN, gbeSnowyHydro, gbeAssetSales,
+      gbeNewCorp, gbeNewCorpSize, gbeNewCorpYield,
+      gbeDefHousing, gbeAnsto, gbeAirservices, gbeMint, gbeAusTrade,
+      reAcqTelstra, reAcqAirports, reAcqPorts, reAcqCommsBank,
+      gbeHousingCorp, gbeHousingCapB, gbeMfgCorp, gbeMfgCapB,
+      gbeCritMin, gbeCritMinCapB, gbeRegBank, gbeRegBankCapB,
+      gbeRewiringCorp, gbeRewiringCapB, gbeFirstNations, gbeFirstNatCapB,
+    },
+    spending: {
+      pensRate, pensAge, pensAsset, jsRate, jsCutout, dspRate, dspPts,
+      ftbA, ftbB, childcare, gpBulk, gpRebate, hospital, pbs, acdc,
+      ndisP, ndisCost, inHome, resCare, eduPerStu, uniRes, uniSub,
+      regHigherEd, defence, roadRail, otherInfra, aps, apsWage,
+      capInv, envProg, vets, aid, housingP, indig, agri, immig, arts,
+      wato, negGearNew, cgtMinTax, phiReform, lossCarry, iawo,
+      pmc, gasReserve, thrivingKids, foundSupports, localInfraFund,
+      helpToBuyExt, helpIndexation,
+      saWhyalla, saHMRB, saNorthernWater,
+      nswWSALink, nswHumeLink, nswM12,
+      vicSRL, vicGeelongRail, vicYarraRecovery,
+      qldBruceHwy, qldOlympics, qldCopperString,
+      waWestport, waMetronet, waPilbaraEnergy,
+      tasMacqPoint, tasBridge, tasFreightEq,
+      ntMiddleArm, ntDefenceDual,
+      actLightRail, actNatInst,
+      youthAllow, austudy, dentalVision, mentalHealth, indigHealth,
+      csiroFund, nhmrcFund, arcFund, vetTafe, afp, borderForce, earlyChild,
+    },
+    funds: {
+      // Future Fund Board of Guardians funds (Future Fund Act 2006)
+      ffContrib, ffTargetReturn, ffSalePct, ffDissolve, ffEarlyDraw,
+      mrffContrib, mrffDisburseAdj, mrffSalePct, mrffDissolve,
+      dcafContrib, dcafDisburseAdj, dcafSalePct, dcafDissolve,
+      atsilsffContrib, atsilsffDisburseAdj, atsilsffSalePct, atsilsffDissolve,
+      fdfContrib, fdfDisburseAdj, fdfSalePct, fdfDissolve,
+      drfContrib, drfDisburseAdj, drfSalePct, drfDissolve,
+      haffContrib, haffDisburseAdj, haffSalePct, haffDissolve,
+      // Separate Commonwealth investment corporations
+      cefcContrib, cefcTargetReturn, cefcSalePct, cefcDissolve,
+      nrfcContrib, nrfcTargetReturn, nrfcSalePct, nrfcDissolve,
+      // New proposed funds
+      newSoverFund, newSoverFundCapB, newSoverFundContribAnnual,
+      newGenFund, newGenFundCapB,
+      newInfraFund, newInfraFundCapB,
+      newDefenceFund, newDefenceFundCapB,
+    },
+  });
+
+  const exportSettings = () => {
+    const scenario = { ...buildScenario(), exportedAt: new Date().toISOString() };
+    const blob = new Blob([JSON.stringify(scenario, null, 2)], { type: "application/json" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    const date = new Date().toISOString().split("T")[0];
+    a.href = url;
+    a.download = `aus-budget-scenario-${date}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const importSettings = (e) => {
+    const file = e.target?.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const raw = ev.target?.result;
+        if (typeof raw !== "string") throw new Error("File could not be read as text.");
+        // Detect the delimited block produced by Copy Inputs. If present,
+        // extract just the JSON between the markers; otherwise treat the
+        // entire payload as JSON (legacy .json files).
+        const blockMatch = raw.match(/<<<BUDGET_SIM_v1\s*([\s\S]*?)\s*BUDGET_SIM_v1>>>/);
+        const jsonText = blockMatch ? blockMatch[1] : raw;
+        const data = JSON.parse(jsonText);
+        if (data.schema !== "aus-budget-sim") {
+          alert("This file is not an aus-budget-sim scenario.");
+          return;
+        }
+        // Brackets
+        if (Array.isArray(data.brackets)) {
+          // Re-hydrate Infinity (JSON.stringify converts Infinity to null)
+          const fixed = data.brackets.map(b => ({
+            ...b,
+            max: b.max === null ? Infinity : b.max,
+          }));
+          setBrackets(fixed);
+        }
+        if (typeof data.nextId === "number") setNextId(data.nextId);
+        // Revenue
+        const r = data.revenue || {};
+        if (r.medicare    !== undefined) setMedicare(r.medicare);
+        if (Array.isArray(r.companyBrackets)) {
+          const fixed = r.companyBrackets.map(b => ({ ...b, max: b.max === null ? Infinity : b.max }));
+          setCompanyBrackets(fixed);
+        }
+        if (typeof r.nextCompanyId === "number") setNextCompanyId(r.nextCompanyId);
+        if (r.gstRate     !== undefined) setGstRate(r.gstRate);
+        if (r.gstBase     !== undefined) setGstBase(r.gstBase);
+        if (r.gstRetain   !== undefined) setGstRetain(r.gstRetain);
+        if (r.gstExFood       !== undefined) setGstExFood(r.gstExFood);
+        if (r.gstExHealth     !== undefined) setGstExHealth(r.gstExHealth);
+        if (r.gstExEducation  !== undefined) setGstExEducation(r.gstExEducation);
+        if (r.gstExChildcare  !== undefined) setGstExChildcare(r.gstExChildcare);
+        if (r.gstExReligious  !== undefined) setGstExReligious(r.gstExReligious);
+        if (r.gstExCharity    !== undefined) setGstExCharity(r.gstExCharity);
+        if (r.gstExRentRes    !== undefined) setGstExRentRes(r.gstExRentRes);
+        if (r.gstExFinancial  !== undefined) setGstExFinancial(r.gstExFinancial);
+        if (r.gstExWaterSewer !== undefined) setGstExWaterSewer(r.gstExWaterSewer);
+        if (r.gstExPrecMetals !== undefined) setGstExPrecMetals(r.gstExPrecMetals);
+        if (r.superEarn   !== undefined) setSuperEarn(r.superEarn);
+        if (r.superConc   !== undefined) setSuperConc(r.superConc);
+        if (r.superHB     !== undefined) setSuperHB(r.superHB);
+        if (r.cgtDisc     !== undefined) setCgtDisc(r.cgtDisc);
+        if (r.primRes     !== undefined) setPrimRes(r.primRes);
+        if (r.negGear     !== undefined) setNegGear(r.negGear);
+        if (r.fuel        !== undefined) setFuel(r.fuel);
+        if (r.evRUC       !== undefined) setEvRUC(r.evRUC);
+        if (r.evSurcharge !== undefined) setEvSurcharge(r.evSurcharge);
+        if (r.hvRUC       !== undefined) setHvRUC(r.hvRUC);
+        if (r.hvEvDiscount!== undefined) setHvEvDiscount(r.hvEvDiscount);
+        if (r.tobacco     !== undefined) setTobacco(r.tobacco);
+        if (r.alcohol     !== undefined) setAlcohol(r.alcohol);
+        if (r.prrt        !== undefined) setPrrt(r.prrt);
+        if (r.minLevy     !== undefined) setMinLevy(r.minLevy);
+        if (r.lngLevy     !== undefined) setLngLevy(r.lngLevy);
+        if (r.fbtRate     !== undefined) setFbtRate(r.fbtRate);
+        if (r.fbtExempt   !== undefined) setFbtExempt(r.fbtExempt);
+        if (r.fbtEV          !== undefined) setFbtEV(r.fbtEV);
+        if (r.fbtNovated     !== undefined) setFbtNovated(r.fbtNovated);
+        if (r.fbtRemote      !== undefined) setFbtRemote(r.fbtRemote);
+        if (r.fbtEntertainment !== undefined) setFbtEntertainment(r.fbtEntertainment);
+        if (r.fbtParking     !== undefined) setFbtParking(r.fbtParking);
+        if (r.fbtChildcareWP !== undefined) setFbtChildcareWP(r.fbtChildcareWP);
+        if (r.fbtLaptops     !== undefined) setFbtLaptops(r.fbtLaptops);
+        if (r.fbtLAFHA       !== undefined) setFbtLAFHA(r.fbtLAFHA);
+        if (r.fbtRelocation  !== undefined) setFbtRelocation(r.fbtRelocation);
+        if (r.fbtPBI         !== undefined) setFbtPBI(r.fbtPBI);
+        if (r.fbtReligious   !== undefined) setFbtReligious(r.fbtReligious);
+        if (r.trustMinTaxRate !== undefined) setTrustMinTaxRate(r.trustMinTaxRate);
+        if (r.trustBucketCo   !== undefined) setTrustBucketCo(r.trustBucketCo);
+        if (r.trustS99B       !== undefined) setTrustS99B(r.trustS99B);
+        if (r.trustLossRecoup !== undefined) setTrustLossRecoup(r.trustLossRecoup);
+        if (r.trustFTE        !== undefined) setTrustFTE(r.trustFTE);
+        if (r.trustStreaming  !== undefined) setTrustStreaming(r.trustStreaming);
+        if (r.trustCgtDisc    !== undefined) setTrustCgtDisc(r.trustCgtDisc);
+        if (r.lvt         !== undefined) setLvt(r.lvt);
+        if (r.carbon      !== undefined) setCarbon(r.carbon);
+        if (r.estate      !== undefined) setEstate(r.estate);
+        if (r.wealth      !== undefined) setWealth(r.wealth);
+        if (r.finTax      !== undefined) setFinTax(r.finTax);
+        if (r.customs     !== undefined) setCustoms(r.customs);
+        if (r.luxCar      !== undefined) setLuxCar(r.luxCar);
+        if (r.wineEq      !== undefined) setWineEq(r.wineEq);
+        if (r.plasticExcise   !== undefined) setPlasticExcise(r.plasticExcise);
+        if (r.sugarLevy       !== undefined) setSugarLevy(r.sugarLevy);
+        if (r.digitalSvc      !== undefined) setDigitalSvc(r.digitalSvc);
+        if (r.monopolyLevy    !== undefined) setMonopolyLevy(r.monopolyLevy);
+        if (r.singleUsePlastic !== undefined) setSingleUsePlastic(r.singleUsePlastic);
+        if (r.eWasteLevy      !== undefined) setEWasteLevy(r.eWasteLevy);
+        if (r.tyreLevy        !== undefined) setTyreLevy(r.tyreLevy);
+        if (r.gamblingLevy    !== undefined) setGamblingLevy(r.gamblingLevy);
+        if (r.vapesExcise     !== undefined) setVapesExcise(r.vapesExcise);
+        if (r.alcoholHealth   !== undefined) setAlcoholHealth(r.alcoholHealth);
+        if (r.airEmissions    !== undefined) setAirEmissions(r.airEmissions);
+        if (r.batteryLevy     !== undefined) setBatteryLevy(r.batteryLevy);
+        if (r.natLNG          !== undefined) setNatLNG(r.natLNG);
+        if (r.natIronOre      !== undefined) setNatIronOre(r.natIronOre);
+        if (r.natCoalGen      !== undefined) setNatCoalGen(r.natCoalGen);
+        if (r.natBanking      !== undefined) setNatBanking(r.natBanking);
+        // Phase 10 — missing tax areas & GBEs
+        if (r.ftcRate         !== undefined) setFtcRate(r.ftcRate);
+        if (r.ftcMining       !== undefined) setFtcMining(r.ftcMining);
+        if (r.ftcAg           !== undefined) setFtcAg(r.ftcAg);
+        if (r.mlsThreshold    !== undefined) setMlsThreshold(r.mlsThreshold);
+        if (r.mlsRate         !== undefined) setMlsRate(r.mlsRate);
+        if (r.withholdDiv     !== undefined) setWithholdDiv(r.withholdDiv);
+        if (r.withholdInt     !== undefined) setWithholdInt(r.withholdInt);
+        if (r.withholdRoy     !== undefined) setWithholdRoy(r.withholdRoy);
+        if (r.div293Thresh    !== undefined) setDiv293Thresh(r.div293Thresh);
+        if (r.paygInstalment  !== undefined) setPaygInstalment(r.paygInstalment);
+        if (r.rdIncentive     !== undefined) setRdIncentive(r.rdIncentive);
+        if (r.thinCap         !== undefined) setThinCap(r.thinCap);
+        if (r.litoMax         !== undefined) setLitoMax(r.litoMax);
+        if (r.gbeAusPost      !== undefined) setGbeAusPost(r.gbeAusPost);
+        if (r.gbeNBN          !== undefined) setGbeNBN(r.gbeNBN);
+        if (r.gbeSnowyHydro   !== undefined) setGbeSnowyHydro(r.gbeSnowyHydro);
+        if (r.gbeAssetSales   !== undefined) setGbeAssetSales(r.gbeAssetSales);
+        if (r.gbeNewCorp      !== undefined) setGbeNewCorp(r.gbeNewCorp);
+        if (r.gbeNewCorpSize  !== undefined) setGbeNewCorpSize(r.gbeNewCorpSize);
+        if (r.gbeNewCorpYield !== undefined) setGbeNewCorpYield(r.gbeNewCorpYield);
+        // Phase 11 — extended GBEs
+        if (r.gbeDefHousing   !== undefined) setGbeDefHousing(r.gbeDefHousing);
+        if (r.gbeAnsto        !== undefined) setGbeAnsto(r.gbeAnsto);
+        if (r.gbeAirservices  !== undefined) setGbeAirservices(r.gbeAirservices);
+        if (r.gbeMint         !== undefined) setGbeMint(r.gbeMint);
+        if (r.gbeAusTrade     !== undefined) setGbeAusTrade(r.gbeAusTrade);
+        if (r.reAcqTelstra    !== undefined) setReAcqTelstra(r.reAcqTelstra);
+        if (r.reAcqAirports   !== undefined) setReAcqAirports(r.reAcqAirports);
+        if (r.reAcqPorts      !== undefined) setReAcqPorts(r.reAcqPorts);
+        if (r.reAcqCommsBank  !== undefined) setReAcqCommsBank(r.reAcqCommsBank);
+        if (r.gbeHousingCorp  !== undefined) setGbeHousingCorp(r.gbeHousingCorp);
+        if (r.gbeHousingCapB  !== undefined) setGbeHousingCapB(r.gbeHousingCapB);
+        if (r.gbeMfgCorp      !== undefined) setGbeMfgCorp(r.gbeMfgCorp);
+        if (r.gbeMfgCapB      !== undefined) setGbeMfgCapB(r.gbeMfgCapB);
+        if (r.gbeCritMin      !== undefined) setGbeCritMin(r.gbeCritMin);
+        if (r.gbeCritMinCapB  !== undefined) setGbeCritMinCapB(r.gbeCritMinCapB);
+        if (r.gbeRegBank      !== undefined) setGbeRegBank(r.gbeRegBank);
+        if (r.gbeRegBankCapB  !== undefined) setGbeRegBankCapB(r.gbeRegBankCapB);
+        if (r.gbeRewiringCorp !== undefined) setGbeRewiringCorp(r.gbeRewiringCorp);
+        if (r.gbeRewiringCapB !== undefined) setGbeRewiringCapB(r.gbeRewiringCapB);
+        if (r.gbeFirstNations !== undefined) setGbeFirstNations(r.gbeFirstNations);
+        if (r.gbeFirstNatCapB !== undefined) setGbeFirstNatCapB(r.gbeFirstNatCapB);
+        // Spending
+        const s = data.spending || {};
+        if (s.pensRate    !== undefined) setPensRate(s.pensRate);
+        if (s.pensAge     !== undefined) setPensAge(s.pensAge);
+        if (s.pensAsset   !== undefined) setPensAsset(s.pensAsset);
+        if (s.jsRate      !== undefined) setJsRate(s.jsRate);
+        if (s.jsCutout    !== undefined) setJsCutout(s.jsCutout);
+        if (s.dspRate     !== undefined) setDspRate(s.dspRate);
+        if (s.dspPts      !== undefined) setDspPts(s.dspPts);
+        if (s.ftbA        !== undefined) setFtbA(s.ftbA);
+        if (s.ftbB        !== undefined) setFtbB(s.ftbB);
+        if (s.childcare   !== undefined) setChildcare(s.childcare);
+        if (s.gpBulk      !== undefined) setGpBulk(s.gpBulk);
+        if (s.gpRebate    !== undefined) setGpRebate(s.gpRebate);
+        if (s.hospital    !== undefined) setHospital(s.hospital);
+        if (s.pbs         !== undefined) setPbs(s.pbs);
+        if (s.acdc        !== undefined) setAcdc(s.acdc);
+        if (s.ndisP       !== undefined) setNdisP(s.ndisP);
+        if (s.ndisCost    !== undefined) setNdisCost(s.ndisCost);
+        if (s.inHome      !== undefined) setInHome(s.inHome);
+        if (s.resCare     !== undefined) setResCare(s.resCare);
+        if (s.eduPerStu   !== undefined) setEduPerStu(s.eduPerStu);
+        if (s.uniRes      !== undefined) setUniRes(s.uniRes);
+        if (s.uniSub      !== undefined) setUniSub(s.uniSub);
+        if (s.regHigherEd !== undefined) setRegHigherEd(s.regHigherEd);
+        if (s.defence     !== undefined) setDefence(s.defence);
+        if (s.roadRail    !== undefined) setRoadRail(s.roadRail);
+        if (s.otherInfra  !== undefined) setOtherInfra(s.otherInfra);
+        if (s.aps         !== undefined) setAps(s.aps);
+        if (s.apsWage     !== undefined) setApsWage(s.apsWage);
+        if (s.capInv      !== undefined) setCapInv(s.capInv);
+        if (s.envProg     !== undefined) setEnvProg(s.envProg);
+        if (s.vets        !== undefined) setVets(s.vets);
+        if (s.aid         !== undefined) setAid(s.aid);
+        if (s.housingP    !== undefined) setHousingP(s.housingP);
+        if (s.indig       !== undefined) setIndig(s.indig);
+        if (s.agri        !== undefined) setAgri(s.agri);
+        if (s.immig       !== undefined) setImmig(s.immig);
+        if (s.arts        !== undefined) setArts(s.arts);
+        // Phase 5 measures
+        if (s.wato           !== undefined) setWato(s.wato);
+        if (s.negGearNew     !== undefined) setNegGearNew(s.negGearNew);
+        if (s.cgtMinTax      !== undefined) setCgtMinTax(s.cgtMinTax);
+        if (s.phiReform      !== undefined) setPhiReform(s.phiReform);
+        if (s.lossCarry      !== undefined) setLossCarry(s.lossCarry);
+        if (s.iawo           !== undefined) setIawo(s.iawo);
+        if (s.pmc            !== undefined) setPmc(s.pmc);
+        if (s.gasReserve     !== undefined) setGasReserve(s.gasReserve);
+        if (s.thrivingKids   !== undefined) setThrivingKids(s.thrivingKids);
+        if (s.foundSupports  !== undefined) setFoundSupports(s.foundSupports);
+        if (s.localInfraFund !== undefined) setLocalInfraFund(s.localInfraFund);
+        if (s.helpToBuyExt   !== undefined) setHelpToBuyExt(s.helpToBuyExt);
+        if (s.helpIndexation !== undefined) setHelpIndexation(s.helpIndexation);
+        if (s.saWhyalla      !== undefined) setSaWhyalla(s.saWhyalla);
+        if (s.saHMRB         !== undefined) setSaHMRB(s.saHMRB);
+        if (s.saNorthernWater!== undefined) setSaNorthernWater(s.saNorthernWater);
+        if (s.nswWSALink     !== undefined) setNswWSALink(s.nswWSALink);
+        if (s.nswHumeLink    !== undefined) setNswHumeLink(s.nswHumeLink);
+        if (s.nswM12         !== undefined) setNswM12(s.nswM12);
+        if (s.vicSRL         !== undefined) setVicSRL(s.vicSRL);
+        if (s.vicGeelongRail !== undefined) setVicGeelongRail(s.vicGeelongRail);
+        if (s.vicYarraRecovery !== undefined) setVicYarraRecovery(s.vicYarraRecovery);
+        if (s.qldBruceHwy    !== undefined) setQldBruceHwy(s.qldBruceHwy);
+        if (s.qldOlympics    !== undefined) setQldOlympics(s.qldOlympics);
+        if (s.qldCopperString!== undefined) setQldCopperString(s.qldCopperString);
+        if (s.waWestport     !== undefined) setWaWestport(s.waWestport);
+        if (s.waMetronet     !== undefined) setWaMetronet(s.waMetronet);
+        if (s.waPilbaraEnergy!== undefined) setWaPilbaraEnergy(s.waPilbaraEnergy);
+        if (s.tasMacqPoint   !== undefined) setTasMacqPoint(s.tasMacqPoint);
+        if (s.tasBridge      !== undefined) setTasBridge(s.tasBridge);
+        if (s.tasFreightEq   !== undefined) setTasFreightEq(s.tasFreightEq);
+        if (s.ntMiddleArm    !== undefined) setNtMiddleArm(s.ntMiddleArm);
+        if (s.ntDefenceDual  !== undefined) setNtDefenceDual(s.ntDefenceDual);
+        if (s.actLightRail   !== undefined) setActLightRail(s.actLightRail);
+        if (s.actNatInst     !== undefined) setActNatInst(s.actNatInst);
+        // Phase 8 spending expansion
+        if (s.youthAllow     !== undefined) setYouthAllow(s.youthAllow);
+        if (s.austudy        !== undefined) setAustudy(s.austudy);
+        if (s.dentalVision   !== undefined) setDentalVision(s.dentalVision);
+        if (s.mentalHealth   !== undefined) setMentalHealth(s.mentalHealth);
+        if (s.indigHealth    !== undefined) setIndigHealth(s.indigHealth);
+        if (s.csiroFund      !== undefined) setCsiroFund(s.csiroFund);
+        if (s.nhmrcFund      !== undefined) setNhmrcFund(s.nhmrcFund);
+        if (s.arcFund        !== undefined) setArcFund(s.arcFund);
+        if (s.vetTafe        !== undefined) setVetTafe(s.vetTafe);
+        if (s.afp            !== undefined) setAfp(s.afp);
+        if (s.borderForce    !== undefined) setBorderForce(s.borderForce);
+        if (s.earlyChild     !== undefined) setEarlyChild(s.earlyChild);
+
+        // ── Commonwealth Investment Funds (Phase 13) ────────────────────────
+        const f = data.funds || {};
+        if (f.ffContrib       !== undefined) setFfContrib(f.ffContrib);
+        if (f.ffTargetReturn  !== undefined) setFfTargetReturn(f.ffTargetReturn);
+        if (f.ffSalePct       !== undefined) setFfSalePct(f.ffSalePct);
+        if (f.ffDissolve      !== undefined) setFfDissolve(f.ffDissolve);
+        if (f.ffEarlyDraw     !== undefined) setFfEarlyDraw(f.ffEarlyDraw);
+        if (f.mrffContrib     !== undefined) setMrffContrib(f.mrffContrib);
+        if (f.mrffDisburseAdj !== undefined) setMrffDisburseAdj(f.mrffDisburseAdj);
+        if (f.mrffSalePct     !== undefined) setMrffSalePct(f.mrffSalePct);
+        if (f.mrffDissolve    !== undefined) setMrffDissolve(f.mrffDissolve);
+        if (f.dcafContrib     !== undefined) setDcafContrib(f.dcafContrib);
+        if (f.dcafDisburseAdj !== undefined) setDcafDisburseAdj(f.dcafDisburseAdj);
+        if (f.dcafSalePct     !== undefined) setDcafSalePct(f.dcafSalePct);
+        if (f.dcafDissolve    !== undefined) setDcafDissolve(f.dcafDissolve);
+        if (f.atsilsffContrib     !== undefined) setAtsilsffContrib(f.atsilsffContrib);
+        if (f.atsilsffDisburseAdj !== undefined) setAtsilsffDisburseAdj(f.atsilsffDisburseAdj);
+        if (f.atsilsffSalePct     !== undefined) setAtsilsffSalePct(f.atsilsffSalePct);
+        if (f.atsilsffDissolve    !== undefined) setAtsilsffDissolve(f.atsilsffDissolve);
+        if (f.fdfContrib      !== undefined) setFdfContrib(f.fdfContrib);
+        if (f.fdfDisburseAdj  !== undefined) setFdfDisburseAdj(f.fdfDisburseAdj);
+        if (f.fdfSalePct      !== undefined) setFdfSalePct(f.fdfSalePct);
+        if (f.fdfDissolve     !== undefined) setFdfDissolve(f.fdfDissolve);
+        if (f.drfContrib      !== undefined) setDrfContrib(f.drfContrib);
+        if (f.drfDisburseAdj  !== undefined) setDrfDisburseAdj(f.drfDisburseAdj);
+        if (f.drfSalePct      !== undefined) setDrfSalePct(f.drfSalePct);
+        if (f.drfDissolve     !== undefined) setDrfDissolve(f.drfDissolve);
+        if (f.haffContrib     !== undefined) setHaffContrib(f.haffContrib);
+        if (f.haffDisburseAdj !== undefined) setHaffDisburseAdj(f.haffDisburseAdj);
+        if (f.haffSalePct     !== undefined) setHaffSalePct(f.haffSalePct);
+        if (f.haffDissolve    !== undefined) setHaffDissolve(f.haffDissolve);
+        if (f.cefcContrib       !== undefined) setCefcContrib(f.cefcContrib);
+        if (f.cefcTargetReturn  !== undefined) setCefcTargetReturn(f.cefcTargetReturn);
+        if (f.cefcSalePct       !== undefined) setCefcSalePct(f.cefcSalePct);
+        if (f.cefcDissolve      !== undefined) setCefcDissolve(f.cefcDissolve);
+        if (f.nrfcContrib       !== undefined) setNrfcContrib(f.nrfcContrib);
+        if (f.nrfcTargetReturn  !== undefined) setNrfcTargetReturn(f.nrfcTargetReturn);
+        if (f.nrfcSalePct       !== undefined) setNrfcSalePct(f.nrfcSalePct);
+        if (f.nrfcDissolve      !== undefined) setNrfcDissolve(f.nrfcDissolve);
+        if (f.newSoverFund      !== undefined) setNewSoverFund(f.newSoverFund);
+        if (f.newSoverFundCapB  !== undefined) setNewSoverFundCapB(f.newSoverFundCapB);
+        if (f.newSoverFundContribAnnual !== undefined) setNewSoverFundContribAnnual(f.newSoverFundContribAnnual);
+        if (f.newGenFund        !== undefined) setNewGenFund(f.newGenFund);
+        if (f.newGenFundCapB    !== undefined) setNewGenFundCapB(f.newGenFundCapB);
+        if (f.newInfraFund      !== undefined) setNewInfraFund(f.newInfraFund);
+        if (f.newInfraFundCapB  !== undefined) setNewInfraFundCapB(f.newInfraFundCapB);
+        if (f.newDefenceFund    !== undefined) setNewDefenceFund(f.newDefenceFund);
+        if (f.newDefenceFundCapB !== undefined) setNewDefenceFundCapB(f.newDefenceFundCapB);
+      } catch (err) {
+        alert("Failed to import scenario: " + err.message);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = ""; // allow re-importing the same file
+  };
+
+  // ── Auto-save / restore via artifact storage API ──────────────────────────
+  // Persists user's settings between sessions. Uses the artifact-supplied
+  // window.storage (not localStorage). Debounced to avoid excessive writes.
+  const hasHydrated = useRef(false);
+
+  // Restore on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (typeof window === "undefined" || !window.storage) return;
+        const result = await window.storage.get("ausBudgetSim_state");
+        if (cancelled || !result || !result.value) return;
+        const data = JSON.parse(result.value);
+        if (data.schema === "aus-budget-sim") {
+          // Reuse import logic via a synthetic event
+          importSettings({ target: { files: [new Blob([result.value], { type: "application/json" })], value: "" } });
+        }
+      } catch {}
+      finally { hasHydrated.current = true; }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Save on any state change (debounced 500ms)
+  useEffect(() => {
+    if (!hasHydrated.current) return;
+    const timer = setTimeout(async () => {
+      try {
+        if (typeof window === "undefined" || !window.storage) return;
+        const scenario = {
+          schema: "aus-budget-sim", schemaVersion: 1, baselineYear: "2026-27",
+          savedAt: new Date().toISOString(),
+          brackets, nextId,
+          revenue: { medicare, companyBrackets, nextCompanyId, gstRate, gstBase, gstRetain,
+            gstExFood, gstExHealth, gstExEducation, gstExChildcare, gstExReligious,
+            gstExCharity, gstExRentRes, gstExFinancial, gstExWaterSewer, gstExPrecMetals,
+            superEarn, superConc, superHB, cgtDisc, primRes, negGear,
+            fuel, evRUC, evSurcharge, hvRUC, hvEvDiscount,
+            tobacco, alcohol, prrt, minLevy, lngLevy,
+            fbtRate, fbtExempt, fbtEV, fbtNovated, fbtRemote,
+            fbtEntertainment, fbtParking, fbtChildcareWP, fbtLaptops,
+            fbtLAFHA, fbtRelocation, fbtPBI, fbtReligious,
+            trustMinTaxRate, trustBucketCo, trustS99B, trustLossRecoup,
+            trustFTE, trustStreaming, trustCgtDisc,
+            lvt, carbon, estate, wealth, finTax, customs, luxCar, wineEq,
+            plasticExcise, sugarLevy, digitalSvc, monopolyLevy,
+            singleUsePlastic, eWasteLevy, tyreLevy, gamblingLevy, vapesExcise,
+            alcoholHealth, airEmissions, batteryLevy,
+            natLNG, natIronOre, natCoalGen, natBanking,
+            ftcRate, ftcMining, ftcAg, mlsThreshold, mlsRate,
+            withholdDiv, withholdInt, withholdRoy, div293Thresh, paygInstalment,
+            rdIncentive, thinCap, litoMax,
+            gbeAusPost, gbeNBN, gbeSnowyHydro, gbeAssetSales,
+            gbeNewCorp, gbeNewCorpSize, gbeNewCorpYield,
+            gbeDefHousing, gbeAnsto, gbeAirservices, gbeMint, gbeAusTrade,
+            reAcqTelstra, reAcqAirports, reAcqPorts, reAcqCommsBank,
+            gbeHousingCorp, gbeHousingCapB, gbeMfgCorp, gbeMfgCapB,
+            gbeCritMin, gbeCritMinCapB, gbeRegBank, gbeRegBankCapB,
+            gbeRewiringCorp, gbeRewiringCapB, gbeFirstNations, gbeFirstNatCapB },
+          spending: { pensRate, pensAge, pensAsset, jsRate, jsCutout, dspRate, dspPts,
+            ftbA, ftbB, childcare, gpBulk, gpRebate, hospital, pbs, acdc,
+            ndisP, ndisCost, inHome, resCare, eduPerStu, uniRes, uniSub,
+            regHigherEd, defence, roadRail, otherInfra, aps, apsWage,
+            capInv, envProg, vets, aid, housingP, indig, agri, immig, arts,
+            wato, negGearNew, cgtMinTax, phiReform, lossCarry, iawo,
+            pmc, gasReserve, thrivingKids, foundSupports, localInfraFund,
+            helpToBuyExt, helpIndexation,
+        saWhyalla, saHMRB, saNorthernWater,
+        nswWSALink, nswHumeLink, nswM12,
+        vicSRL, vicGeelongRail, vicYarraRecovery,
+        qldBruceHwy, qldOlympics, qldCopperString,
+        waWestport, waMetronet, waPilbaraEnergy,
+        tasMacqPoint, tasBridge, tasFreightEq,
+        ntMiddleArm, ntDefenceDual,
+        actLightRail, actNatInst,
+            youthAllow, austudy, dentalVision, mentalHealth, indigHealth,
+            csiroFund, nhmrcFund, arcFund, vetTafe, afp, borderForce, earlyChild },
+        };
+        await window.storage.set("ausBudgetSim_state", JSON.stringify(scenario));
+      } catch {}
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [brackets, nextId, medicare, companyBrackets, nextCompanyId, gstRate, gstBase, gstRetain,
+      gstExFood, gstExHealth, gstExEducation, gstExChildcare, gstExReligious,
+      gstExCharity, gstExRentRes, gstExFinancial, gstExWaterSewer, gstExPrecMetals,
+      superEarn, superConc, superHB, cgtDisc, primRes, negGear, fuel, evRUC, evSurcharge,
+      hvRUC, hvEvDiscount, tobacco, alcohol, prrt, minLevy, lngLevy, fbtRate, fbtExempt,
+      fbtEV, fbtNovated, fbtRemote, fbtEntertainment, fbtParking, fbtChildcareWP,
+      fbtLaptops, fbtLAFHA, fbtRelocation, fbtPBI, fbtReligious,
+      trustMinTaxRate, trustBucketCo, trustS99B, trustLossRecoup,
+      trustFTE, trustStreaming, trustCgtDisc,
+      lvt, carbon, estate, wealth, finTax, customs, luxCar, wineEq,
+      plasticExcise, sugarLevy, digitalSvc, monopolyLevy,
+      singleUsePlastic, eWasteLevy, tyreLevy, gamblingLevy, vapesExcise,
+      alcoholHealth, airEmissions, batteryLevy,
+      natLNG, natIronOre, natCoalGen, natBanking,
+      ftcRate, ftcMining, ftcAg, mlsThreshold, mlsRate,
+      withholdDiv, withholdInt, withholdRoy, div293Thresh, paygInstalment,
+      rdIncentive, thinCap, litoMax,
+      gbeAusPost, gbeNBN, gbeSnowyHydro, gbeAssetSales,
+      gbeNewCorp, gbeNewCorpSize, gbeNewCorpYield,
+      gbeDefHousing, gbeAnsto, gbeAirservices, gbeMint, gbeAusTrade,
+      reAcqTelstra, reAcqAirports, reAcqPorts, reAcqCommsBank,
+      gbeHousingCorp, gbeHousingCapB, gbeMfgCorp, gbeMfgCapB,
+      gbeCritMin, gbeCritMinCapB, gbeRegBank, gbeRegBankCapB,
+      gbeRewiringCorp, gbeRewiringCapB, gbeFirstNations, gbeFirstNatCapB,
+      pensRate, pensAge, pensAsset, jsRate, jsCutout, dspRate, dspPts, ftbA, ftbB, childcare,
+      gpBulk, gpRebate, hospital, pbs, acdc, ndisP, ndisCost, inHome, resCare,
+      eduPerStu, uniRes, uniSub, regHigherEd, defence, roadRail, otherInfra,
+      aps, apsWage, capInv, envProg, vets, aid, housingP, indig, agri, immig,
+      arts, wato, negGearNew, cgtMinTax, phiReform, lossCarry,
+      iawo, pmc, gasReserve, thrivingKids, foundSupports, localInfraFund,
+      helpToBuyExt, helpIndexation,
+        saWhyalla, saHMRB, saNorthernWater,
+        nswWSALink, nswHumeLink, nswM12,
+        vicSRL, vicGeelongRail, vicYarraRecovery,
+        qldBruceHwy, qldOlympics, qldCopperString,
+        waWestport, waMetronet, waPilbaraEnergy,
+        tasMacqPoint, tasBridge, tasFreightEq,
+        ntMiddleArm, ntDefenceDual,
+        actLightRail, actNatInst,
+      youthAllow, austudy, dentalVision, mentalHealth, indigHealth,
+      csiroFund, nhmrcFund, arcFund, vetTafe, afp, borderForce, earlyChild]);
+
+  // ── AI Analysis ──────────────────────────────────────────────────────────
+  const analyse = async (revC, spendC) => {
+    setAiLoading(true);
+    setAiText("");
+    const sortedBk = [...brackets].sort((a, b) => a.min - b.min);
+    const brkSummary = sortedBk.map(b =>
+      `${b.min === 0 ? "$0" : "$" + b.min.toLocaleString()}–${b.max === Infinity ? "∞" : "$" + b.max.toLocaleString()} @ ${b.rate}%`
+    ).join("; ");
+    const bal = BASELINE_DEFICIT + revC - spendC;
+    const fe = forwardEstimates;
+    const cum5yr = fe[fe.length - 1].cumImprovement;
+    const ucbPath = fe.map(r => `${r.year}: ${r.userUcbPct >= 0 ? "+" : ""}${r.userUcbPct.toFixed(1)}%`).join(", ");
+    const lines = [
+      `Budget year: 2026-27 (May 2026 Budget)`,
+      `Balance: ${bal >= 0 ? "Surplus" : "Deficit"} $${Math.abs(bal).toFixed(1)}B (${(bal/GDP*100).toFixed(2)}% GDP)`,
+      `Revenue: $${(BASELINE_RECEIPTS + revC).toFixed(1)}B (${((BASELINE_RECEIPTS+revC)/GDP*100).toFixed(1)}% GDP) — change: ${revC>=0?"+":""}${revC.toFixed(1)}B`,
+      `Spending: $${(BASELINE_PAYMENTS + spendC).toFixed(1)}B (${((BASELINE_PAYMENTS+spendC)/GDP*100).toFixed(1)}% GDP) — change: ${spendC>=0?"+":""}${spendC.toFixed(1)}B`,
+      `5-year UCB path under proposed settings: ${ucbPath}`,
+      `Cumulative 5-year improvement vs baseline: ${cum5yr >= 0 ? "+" : ""}$${cum5yr.toFixed(1)}B`,
+      `2030-31 gross debt: ${fe[4].userDebtPct.toFixed(1)}% GDP (baseline: ${fe[4].baselineDebtPct.toFixed(1)}% GDP)`,
+      `Context: Baseline includes Middle East fuel-supply shock (oil price effects on nominal GDP) and Stage 4 tax cuts (1 July 2026). Structural deficit is approximately 0.5pp wider than headline UCB in 2026-27 due to cyclical commodity revenues; structural and headline trajectories converge by 2027-28.`,
+      `Income tax brackets: ${brkSummary}`,
+      `Medicare levy: ${medicare}%`,
+      (companyBrackets.some((b, i) => b.rate !== DEFAULT_COMPANY_BRACKETS[i]?.rate))
+        ? `Company tax brackets (progressive): ${[...companyBrackets].sort((a,b)=>a.min-b.min).map(b => `${b.min===0?"$0":"$"+b.min.toLocaleString()}–${b.max===Infinity?"∞":"$"+b.max.toLocaleString()}@${b.rate}%`).join("; ")}`
+        : null,
+      gstRate !== 10    ? `GST rate: ${gstRate}% (passes to states under FFR Act 2009)` : null,
+      gstRetain > 0     ? `Cth GST retention: ${gstRetain}% (requires renegotiating FFR Act 2009)` : null,
+      (gstExFood || gstExHealth || gstExEducation || gstExChildcare || gstExReligious || gstExCharity || gstExRentRes || gstExFinancial || gstExWaterSewer || gstExPrecMetals)
+        ? `GST exemptions removed: ${[gstExFood&&"fresh food",gstExHealth&&"health",gstExEducation&&"education",gstExChildcare&&"childcare",gstExReligious&&"religious",gstExCharity&&"charity",gstExRentRes&&"residential rent",gstExFinancial&&"financial supplies",gstExWaterSewer&&"water/sewerage",gstExPrecMetals&&"precious metals"].filter(Boolean).join(", ")}`
+        : null,
+      lvt > 0           ? `Land value tax: ${lvt}%/yr` : null,
+      carbon > 0        ? `Carbon price: $${carbon}/t (drafted as excise per s.90)` : null,
+      estate > 0        ? `Estate tax: ${estate}%` : null,
+      wealth > 0        ? `Wealth tax: ${wealth}%/yr` : null,
+      lngLevy > 0       ? `LNG levy: $${lngLevy}/GJ` : null,
+      minLevy > 0       ? `Mineral resources levy: ${minLevy}%` : null,
+      pensAge !== 67    ? `Pension age: ${pensAge}` : null,
+      pensRate !== 1150 ? `Pension rate: $${pensRate}/fn` : null,
+      jsRate !== 810    ? `JobSeeker: $${jsRate}/fn` : null,
+      ndisP !== 720 || ndisCost !== 78 ? `NDIS: ${ndisP}k × $${ndisCost}k = $${(ndisP*ndisCost/1000).toFixed(1)}B (vs $56.1B baseline incl. reform trajectory)` : null,
+      hospital !== 37.4 ? `Federal hospital funding: $${hospital}B/yr` : null,
+      defence !== 2.02  ? `Defence: ${defence}% GDP` : null,
+      acdc !== 0.2      ? `ACDC funding: $${acdc.toFixed(1)}B/yr` : null,
+    ].filter(Boolean).join("\n");
+
+    try {
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1000,
+          system: "You are an Australian fiscal policy analyst familiar with the 2026-27 Commonwealth Budget. Provide a concise 3-4 paragraph analysis covering: (1) fiscal sustainability and structural balance implications; (2) key economic effects in the context of the post-Middle East-conflict economic environment and Stage 4 tax cuts; (3) social and distributional effects; (4) major risks, legal pathways or constitutional considerations. Be direct and formal. Use Australian English. Cite relevant Commonwealth Acts where applicable (e.g. Federal Financial Relations Act 2009, Income Tax Assessment Act 1997). Plain prose — no bullet points.",
+          messages: [{ role: "user", content: "Analyse this proposed Australian federal budget:\n\n" + lines }]
+        })
+      });
+      const data = await resp.json();
+      const text = (data.content || []).filter(c => c.type === "text").map(c => c.text).join("");
+      setAiText(text || "Analysis unavailable.");
+    } catch {
+      setAiText("Analysis request failed. Please try again.");
+    }
+    setAiLoading(false);
+  };
+
+  // ── Revenue calculation ───────────────────────────────────────────────────
+  // Positive revChange = more revenue = better for budget.
+  const revChange = useMemo(() => {
+    let c = 0;
+
+    // Income tax (delta from baseline, using income pools)
+    c += calcIncomeTax(brackets) - BASELINE_IT;
+
+    // Medicare levy: 2% on $1,500B base ≈ $30B; each 1pp ≈ $15B
+    c += (medicare - 2) * (MEDICARE_BASE / 100);
+
+    // Company tax (progressive brackets; baseline $154B)
+    c += calcCompanyTax(companyBrackets) - BASELINE_COMPANY;
+
+    // GST — passes through to states under the Federal Financial Relations Act 2009.
+    // Net Commonwealth impact = retention share × total GST collected.
+    const gstCollectedBase = GST_PASS_THROUGH;                 // $104.2B baseline
+    const gstRateUplift    = (gstRate - 10) * 10.42;           // +$10.4B per 1pp
+    const gstBaseUplift    = gstBase ? 20 : 0;                 // legacy bulk-expand toggle
+    // Itemised exemption removals (revenue if each category subject to 10% GST)
+    const gstExempUplift   = (gstExFood        ? 8.0 : 0)
+                           + (gstExHealth      ? 6.0 : 0)
+                           + (gstExEducation   ? 3.0 : 0)
+                           + (gstExChildcare   ? 1.0 : 0)
+                           + (gstExReligious   ? 0.3 : 0)
+                           + (gstExCharity     ? 0.4 : 0)
+                           + (gstExRentRes     ? 4.0 : 0)
+                           + (gstExFinancial   ? 3.0 : 0)
+                           + (gstExWaterSewer  ? 0.5 : 0)
+                           + (gstExPrecMetals  ? 0.05: 0);
+    const gstTotalFlow     = gstCollectedBase + gstRateUplift + gstBaseUplift + gstExempUplift;
+    c += gstTotalFlow * (gstRetain / 100);                     // Cth retains this share
+
+    // Superannuation (baseline $31.6B, Div 296 in effect)
+    c += (superEarn - 15) * 2.1;      // Each 1pp ≈ $2.1B
+    c += (superConc - 15) * 1.8;      // Each 1pp ≈ $1.8B
+    c += (superHB  - 30) * 0.4;       // Each 1pp above 30% ≈ $400M (small affected pool)
+
+    // CGT (baseline $34.2B, BP1 Table 5.7 memo)
+    c += -(cgtDisc - 50) / 10 * 4.5;  // Each 10pp reduction in discount ≈ $4.5B
+    c += primRes / 100 * 22;          // Full primary-residence inclusion ≈ +$22B
+
+    // Negative gearing: full restriction saves ≈ $4B
+    c += negGear / 100 * 4;
+
+    // Fuel excise (with FTC interaction — net of Fuel Tax Credits scheme)
+    c += fuelImpactDelta(fuel);
+
+    // EV road user charge (no federal charge currently exists)
+    c += evRUC * 0.4;                 // 1¢/km ≈ $400M
+
+    // Tobacco (structural collapse — baseline $3.6B, BP1 Table 5.7)
+    c += (tobacco - 1.75) * 1.0;      // Each $1/stick ≈ $1B at current base
+
+    // Alcohol (baseline ≈ $3B)
+    c += (alcohol - 0.70) / 0.70 * 3;
+
+    // Resources
+    c += Math.max(0, prrt - 40) * 0.30;   // PRRT (baseline $1.9B); each 1pp ≈ $300M
+    c += minLevy * 0.75;                   // Each 1% ≈ $750M
+    c += lngLevy * 4.3;                    // $1/GJ ≈ $4.3B
+
+    // FBT (baseline $5.58B)
+    c += (fbtRate - 47) * 0.12;       // Each 1pp ≈ $120M
+    c += fbtExempt / 100 * 2;         // Full exemption removal ≈ +$2B
+
+    // Land value tax: 1% on ~$6.6T unimproved land value
+    if (lvt > 0) c += lvt * 66;
+
+    // Carbon price (diminishing returns as behaviour changes; ~430Mt CO₂e/yr)
+    if (carbon > 0) {
+      if      (carbon <= 30)  c += carbon / 30 * 4;
+      else if (carbon <= 75)  c += 4 + (carbon - 30) / 45 * 5;
+      else                    c += 9 + (carbon - 75) / 75 * 4;
+    }
+
+    // Estate tax: 20% ≈ $7B (no federal estate tax since 1979)
+    c += estate / 20 * 7;
+
+    // Wealth tax (diminishing above 1% due to avoidance)
+    if (wealth > 0) c += wealth <= 1 ? wealth * 6 : 6 + (wealth - 1) * 4;
+
+    // Financial transactions tax
+    if (finTax > 0) c += finTax <= 0.1 ? finTax / 0.1 : 1 + (finTax - 0.1) / 0.4 * 3;
+
+    // Customs (baseline ~$7.3B)
+    c += customs / 100 * 7.3;
+
+    // Luxury car & wine
+    c += (luxCar - 33) * 0.03;
+    c += (wineEq - 29) * 0.035;
+
+    // ── Phase 5 Budget measures (tax side) ───────────────────────────────────
+    // WATO: Working Australian Tax Offset (full-year effect in 2027-28+ income year).
+    // BP2 shows -$6.4B over 5 years. Annual cost at maturity ~$1.6B/yr (negative for budget).
+    c -= (wato / 250) * 1.6;            // Default WATO = $250 offset → -$1.6B/yr
+
+    // Negative gearing restricted to new builds (1 July 2027). With CGT min-tax pkg = +$3.6B/5yr.
+    // INTERACTION: The negGearNew measure restricts ~12.5% of rental losses (new builds share).
+    // At negGear=0 it contributes its full +$0.5B. As negGear rises, it contributes progressively
+    // less — at negGear=100 the full ring-fence already captures this and more, so negGearNew adds $0.
+    const negGearNewEffect = negGearNew ? Math.max(0, 0.5 * (1 - negGear / 100)) : 0;
+    c += negGearNewEffect;
+
+    // CGT indexation + 30% effective minimum (1 July 2027).
+    // INTERACTION: If the CGT discount has already been reduced significantly, the minimum-tax
+    // package captures less additional revenue — most assets already face an effective rate above 30%.
+    // At cgtDisc=50 (default): full +$0.8B. At cgtDisc=0 (no discount): $0 incremental effect.
+    const cgtMinTaxEffect = cgtMinTax ? Math.max(0, 0.8 * (cgtDisc / 50)) : 0;
+    c += cgtMinTaxEffect;
+
+    // Discretionary trust 30% minimum tax — MOVED to dedicated Trust Taxation section.
+
+    // Loss carry-back (small companies): ~-$0.5B/yr at maturity.
+    if (lossCarry) c -= 0.5;
+
+    // $20k instant asset write-off permanent: revenue cost is small in the budget year (~$0.3B);
+    // baseline assumes it IS permanent (default true). Turning OFF saves +$0.3B/yr.
+    if (!iawo) c += 0.3;
+
+    // Passenger Movement Charge: currently $70/passenger; ~30M passenger movements/yr ≈ $2.1B baseline.
+    // Each $1 increase ≈ $30M.
+    c += (pmc - 70) * 0.030;
+
+    // Domestic gas reservation: hypothetical % of LNG exports redirected.
+    // Each 1% diverted ≈ -$430M GDP impact but no direct Cth revenue effect unless levied.
+    // Modelled as a small revenue lever via implied royalty differential ($50M per 1% diverted).
+    c += gasReserve * 0.05;
+
+    // ── Phase 8 revenue levers ───────────────────────────────────────────────
+    // Plastic packaging excise: ~1.5Mt eligible packaging/yr; $1/kg ≈ $1.5B gross
+    // (behavioural drop assumed minimal at modest rates; declines above $2/kg)
+    if (plasticExcise > 0) {
+      if (plasticExcise <= 2) c += plasticExcise * 1.5;
+      else c += 3.0 + (plasticExcise - 2) * 0.6;
+    }
+
+    // Sugar-sweetened beverages & processed food levy: ~$1.5B at 10% rate on SSBs
+    // ($15B SSB market) plus modest extension to high-sugar processed foods.
+    // Behavioural elasticity reduces returns above 20%.
+    if (sugarLevy > 0) {
+      if (sugarLevy <= 20) c += sugarLevy / 10 * 1.5;
+      else c += 3.0 + (sugarLevy - 20) / 10 * 0.6;
+    }
+
+    // Digital services levy: ~$50B Australian platform revenue base for major platforms.
+    // 3% ≈ $1.5B before treaty-based credit-back claims; behavioural shifting reduces above 5%.
+    if (digitalSvc > 0) {
+      if (digitalSvc <= 5) c += digitalSvc * 0.5;
+      else c += 2.5 + (digitalSvc - 5) * 0.2;
+    }
+
+    // Monopoly profits levy: hypothetical levy on excess profits in concentrated markets
+    // (banking, supermarkets, telecoms). ~$30B addressable excess profit base.
+    // Each 10pp ≈ $3B at low rates; diminishing as profit-shifting / restructuring occurs.
+    if (monopolyLevy > 0) {
+      if (monopolyLevy <= 10) c += monopolyLevy * 0.3;
+      else c += 3.0 + (monopolyLevy - 10) * 0.15;
+    }
+
+    // EV registration surcharge (federal): ~700,000 BEV+PHEV vehicles. $1/yr ≈ $0.7M.
+    c += evSurcharge / 1000 * 0.7;
+
+    // Heavy vehicle road user charge (separate from automatic FTC mechanic).
+    // Current 20.6¢/L floor. Each 1¢ above ≈ $200M additional net excise revenue.
+    c += (hvRUC - 20.6) * 0.20;
+
+    // EV heavy vehicle equivalent per-km charge — currently EV trucks pay nothing
+    // (fleet still very small, ~500 vehicles). When this lever applies a charge
+    // (hvEvDiscount < 100%), revenue is the equivalent of HVRUC for those km.
+    // Each 1% applied (i.e., 1pp below 100% discount) ≈ $1M at current fleet.
+    if (hvRUC > 0 && hvEvDiscount < 100) {
+      c += (100 - hvEvDiscount) / 100 * 0.005;  // ~$5M at full equivalent + current fleet
+    }
+
+    // FBT — expanded exemption set.
+    // Removing each exemption restores FBT to that category.
+    if (!fbtEV)            c += 0.55; // EV exemption removal
+    if (!fbtNovated)       c += 1.10; // Novated lease tightening
+    if (!fbtRemote)        c += 0.35; // Remote area
+    if (!fbtEntertainment) c += 0.30; // Entertainment / minor benefits (rolling back $300 threshold)
+    if (!fbtParking)       c += 0.50; // Car parking exemption removal (FBTAA s58G)
+    if (!fbtChildcareWP)   c += 0.10; // Work-provided childcare exemption
+    if (!fbtLaptops)       c += 0.20; // Section 58X portable device exemption
+    if (!fbtLAFHA)         c += 0.40; // LAFHA
+    if (!fbtRelocation)    c += 0.20; // Relocation benefits
+    if (!fbtPBI)           c += 0.80; // PBI / charity FBT cap (currently $30k); removal big revenue
+    if (!fbtReligious)     c += 0.05; // Religious institution housing exemption
+
+    // ── Trust taxation ───────────────────────────────────────────────────────
+    // Trust min-tax replaces the Phase 5 toggle with an adjustable rate (0-45%).
+    // Default 30% rate ≈ +$1.2B/yr at maturity. Linear scaling for simplicity.
+    c += trustMinTaxRate / 30 * 1.2;
+    // Bucket company restrictions (prevent distributions to bucket cos for tax min): ~+$0.6B
+    if (trustBucketCo)   c += 0.6;
+    // Section 99B foreign trust treatment tightening: ~+$0.3B
+    if (trustS99B)       c += 0.3;
+    // Trust loss recoupment rules tightening (Schedule 2F ITAA 1936): ~+$0.4B
+    if (trustLossRecoup) c += 0.4;
+    // Family Trust Election (FTE) restrictions: ~+$0.5B (limits use of trust losses)
+    if (trustFTE)        c += 0.5;
+    // Capital gain / franked dividend streaming tightening: ~+$0.7B
+    if (trustStreaming)  c += 0.7;
+    // Remove CGT 50% discount for trust beneficiaries: ~+$1.5B
+    if (trustCgtDisc)    c += 1.5;
+
+    // Expanded environmental & health excises
+    // Single-use plastic items (cutlery, straws, takeaway containers): ~5 billion units/yr base
+    if (singleUsePlastic > 0) c += singleUsePlastic * 0.5;     // $1/item ≈ $0.5B (high elasticity)
+    // E-waste levy: ~50M consumer electronic devices sold/yr
+    if (eWasteLevy > 0)       c += eWasteLevy / 10 * 0.1;      // $10/device ≈ $100M
+    // Tyre levy: ~25M tyres sold/yr (passenger + commercial)
+    if (tyreLevy > 0)         c += tyreLevy * 0.025;           // $1/tyre ≈ $25M
+    // Online gambling / sports betting levy: ~$15B turnover
+    if (gamblingLevy > 0)     c += gamblingLevy / 10 * 1.5;    // 10% ≈ $1.5B
+    // Vapes / e-cigarette excise (now legal as TGA pharmacy products)
+    if (vapesExcise > 0)      c += vapesExcise * 0.25;         // $1/mL ≈ $0.25B
+    // Alcohol public health levy (on top of existing alcohol excise)
+    if (alcoholHealth > 0)    c += alcoholHealth / 10 * 0.5;   // 10% of $7B base ≈ $0.7B; modelled lower for elasticity
+    // Air travel emissions levy
+    if (airEmissions > 0)     c += airEmissions / 50 * 0.6;    // $50/tCO2e ≈ $0.6B at ~12 Mt aviation CO2e
+    // Battery / lithium recycling fund levy
+    if (batteryLevy > 0)      c += batteryLevy / 5 * 0.1;      // $5/kWh ≈ $0.1B (small base, growing)
+
+    // ── Nationalisation: REVENUE side — dividends from acquired share ─────────
+    // The matching debt-service cost (interest on acquisition debt) flows to the
+    // SPENDING side via PDI. Just-terms acquisition under s.51(xxxi) of the
+    // Constitution — see JT & Co Pty Ltd v Commonwealth (1948).
+    // Annual dividend yields (full ownership): LNG $10B, Iron Ore $20B, Coal Gen $0.5B, Banking $25B.
+    c += natLNG     / 100 * 10;
+    c += natIronOre / 100 * 20;
+    c += natCoalGen / 100 * 0.5;
+    c += natBanking / 100 * 25;
+
+    // ── Missing taxation areas (Phase 10) ────────────────────────────────────
+
+    // Fuel Tax Credits — currently ~$10.7B/yr tax expenditure (Fuel Tax Act 2006 Cth).
+    // FTC restores fuel excise paid on off-road / non-fuel-taxed use. Reducing the
+    // credit rate or removing sectors from eligibility reduces the tax expenditure
+    // (i.e. increases net revenue). Baseline: mining receives ~$8B, agriculture ~$1.5B.
+    const ftcBaseline = 10.7; // $B total FTC entitlement
+    // Rate reduction: reducing from 100% → 0% reclaims full expenditure proportionally
+    c += ftcBaseline * (1 - ftcRate / 100);
+    // Sector removal: mining ~$8B, agriculture ~$1.5B (independently additive if rate is 100%)
+    if (!ftcMining && ftcRate === 100) c += 8.0;
+    if (!ftcAg    && ftcRate === 100) c += 1.5;
+
+    // Medicare Levy Surcharge — currently ~$1.0B/yr (ATO SER).
+    // Threshold reduction or rate increase raises revenue from high-income earners
+    // without private hospital cover. Each $10k threshold reduction ≈ +$80M.
+    // Each 0.1pp rate increase ≈ +$90M.
+    c += (93000 - mlsThreshold) / 10000 * 0.08;   // threshold below $93k adds revenue
+    c += (mlsRate - 1.0) / 0.1 * 0.09;            // rate above 1.0% adds revenue
+
+    // Withholding taxes on non-residents — s.128B ITAA 1936.
+    // Total withholding yield (dividends + interest + royalties) ~$10B/yr.
+    // Each 1pp increase ≈ +$150M (dividends), +$80M (interest), +$100M (royalties).
+    // Treaty rates cap practical maximums for ~60 treaty jurisdictions.
+    c += (withholdDiv - 30) * 0.15;
+    c += (withholdInt - 10) * 0.08;
+    c += (withholdRoy - 30) * 0.10;
+
+    // Division 293 — additional 15% on super contributions for income >$250k.
+    // Currently ~$700M/yr at $250k threshold, ~80,000 individuals.
+    // Reducing threshold to $180k (for example) ≈ +$500M; each $10k ≈ +$70M.
+    c += (250 - div293Thresh) / 10 * 0.07;         // revenue rises as threshold falls
+
+    // PAYG instalment variation — modest lever on investment-income timing.
+    // Each 1pp increase in variation rate ≈ +$0.2B (timing, not structural)
+    c += paygInstalment * 0.2;
+
+    // R&D Tax Incentive — currently ~$3.5B/yr total.
+    // Refundable component (small firms) baseline 43.5%; non-refundable large ~33.5%.
+    // Each 1pp reduction in refundable rate ≈ -$50M cost (i.e. +$50M net revenue).
+    c += (43.5 - rdIncentive) * 0.05;
+
+    // Thin capitalisation tightening (beyond 2023 reforms) ≈ +$0.4B
+    if (thinCap) c += 0.4;
+
+    // LITO — each $100 increase in LITO costs ~$0.7B at current distribution.
+    c -= (litoMax - 700) / 100 * 0.7;
+
+    // Commonwealth GBEs — additional dividends / asset sales
+    // Australia Post: additional dividend above baseline ~$200M/yr
+    c += gbeAusPost / 1000;
+    // NBN Co: efficiency dividend or partial privatisation proceeds
+    c += gbeNBN / 1000;
+    // Snowy Hydro: additional dividend above baseline ~$250M/yr
+    c += gbeSnowyHydro / 1000;
+    // Asset recycling / partial privatisation — one-off proceeds amortised over 10 years
+    c += gbeAssetSales / 10;
+    // New Commonwealth corporation — annual yield modelled at 50% ramp-up in budget year
+    if (gbeNewCorp) c += gbeNewCorpSize * (gbeNewCorpYield / 100) * 0.5;
+
+    // Additional existing GBE dividends
+    c += gbeDefHousing / 1000;   // Defence Housing Australia baseline ~$100M/yr
+    c += gbeAnsto     / 1000;   // ANSTO commercial arm baseline ~$20M/yr
+    c += gbeAirservices/ 1000;  // Airservices Australia baseline ~$130M/yr
+    c += gbeMint      / 1000;   // Royal Australian Mint baseline ~$30M/yr
+    c += gbeAusTrade  / 1000;   // Austrade commercial baseline ~$5M/yr
+
+    // Re-acquisition of privatised assets — voluntary market purchase (not s.51(xxxi) forced acquisition)
+    // Revenue = annual dividends on % stake; debt service = interest on purchase price (spending side).
+    // Telstra: ~$40B market cap; ~$1.6B annual dividends (fully franked). Each 1% ≈ $16M dividends.
+    c += reAcqTelstra / 100 * 1.6;
+    // Major airports (Sydney, Melbourne, Brisbane): ~$30B combined equity value; ~$1.2B combined dividends.
+    c += reAcqAirports / 100 * 1.2;
+    // Major ports (Port of Melbourne, Port Botany, Fremantle): ~$15B combined; ~$0.5B dividends.
+    c += reAcqPorts / 100 * 0.5;
+    // Commonwealth Bank: ~$185B market cap; ~$9B annual dividends. Major political/fiscal undertaking.
+    c += reAcqCommsBank / 100 * 9.0;
+
+    // Individual new proposed Commonwealth corporations — 50% annual return realised in budget year
+    if (gbeHousingCorp)  c += gbeHousingCapB  * 0.045 * 0.5;   // CHFC: ~4.5% blended concessional return
+    if (gbeMfgCorp)      c += gbeMfgCapB      * 0.070 * 0.5;   // ASMC: ~7.0% commercial/strategic blend
+    if (gbeCritMin)      c += gbeCritMinCapB  * 0.090 * 0.5;   // ACMIC: ~9% (higher risk, processing margin)
+    if (gbeRegBank)      c += gbeRegBankCapB  * 0.060 * 0.5;   // CDB: ~6% SME lending return
+    if (gbeRewiringCorp) c += gbeRewiringCapB * 0.055 * 0.5;   // RAC: ~5.5% regulated-asset return
+    if (gbeFirstNations) c += gbeFirstNatCapB * 0.080 * 0.5;   // FNF: ~8% sovereign-wealth return
+
+    // ── Commonwealth Investment Funds — sales, dissolutions, drawdowns ──────
+    // Sales and dissolutions generate one-off revenue in the year of disposal.
+    // Note: dissolving a fund is legally extreme (requires repeal of enabling
+    // Act) and politically explosive. Modelled at face-value AUM for simplicity;
+    // realistic market discount for forced sale would be 5-15%.
+    const fundSale = (aum, salePct, dissolve) => dissolve ? aum : (aum * salePct / 100);
+    c += fundSale(AUM_FUTURE_FUND, ffSalePct, ffDissolve);
+    c += fundSale(AUM_MRFF,        mrffSalePct, mrffDissolve);
+    c += fundSale(AUM_DCAF,        dcafSalePct, dcafDissolve);
+    c += fundSale(AUM_ATSILSFF,    atsilsffSalePct, atsilsffDissolve);
+    c += fundSale(AUM_FDF,         fdfSalePct, fdfDissolve);
+    c += fundSale(AUM_DRF,         drfSalePct, drfDissolve);
+    c += fundSale(AUM_HAFF,        haffSalePct, haffDissolve);
+    c += fundSale(AUM_CEFC,        cefcSalePct, cefcDissolve);
+    c += fundSale(AUM_NRFC,        nrfcSalePct, nrfcDissolve);
+
+    // Future Fund early drawdown (Future Fund Act 2006 permits withdrawal from
+    // 1 July 2020, but Government committed to defer until 2026-27; this lever
+    // models early drawdown for UCB augmentation)
+    c += ffEarlyDraw;
+
+    // Investment returns on retained portion (only Future Fund's mandate
+    // allows withdrawal; others are sub-fund-purpose-restricted)
+    // Annual return on remaining AUM at target rate, less inflation (~3% CPI)
+    const ffRemaining = AUM_FUTURE_FUND * (1 - ffSalePct / 100) * (ffDissolve ? 0 : 1);
+    c += ffRemaining * Math.max(0, ffTargetReturn - 3) / 100 * 0.5;  // 50% of real return attributable
+
+    return c;
+  }, [brackets, medicare, companyBrackets, gstRate, gstBase, gstRetain,
+      gstExFood, gstExHealth, gstExEducation, gstExChildcare, gstExReligious,
+      gstExCharity, gstExRentRes, gstExFinancial, gstExWaterSewer, gstExPrecMetals,
+      superEarn, superConc, superHB, cgtDisc, primRes, negGear, fuel, evRUC,
+      tobacco, alcohol, prrt, minLevy, lngLevy, fbtRate, fbtExempt,
+      lvt, carbon, estate, wealth, finTax, customs, luxCar, wineEq,
+      wato, negGearNew, cgtMinTax, lossCarry, iawo, pmc, gasReserve,
+      plasticExcise, sugarLevy, digitalSvc, monopolyLevy, evSurcharge, hvRUC, hvEvDiscount,
+      fbtEV, fbtNovated, fbtRemote, fbtEntertainment, fbtParking, fbtChildcareWP,
+      fbtLaptops, fbtLAFHA, fbtRelocation, fbtPBI, fbtReligious,
+      trustMinTaxRate, trustBucketCo, trustS99B, trustLossRecoup, trustFTE, trustStreaming, trustCgtDisc,
+      singleUsePlastic, eWasteLevy, tyreLevy, gamblingLevy, vapesExcise,
+      alcoholHealth, airEmissions, batteryLevy,
+      natLNG, natIronOre, natCoalGen, natBanking,
+      ftcRate, ftcMining, ftcAg, mlsThreshold, mlsRate,
+      withholdDiv, withholdInt, withholdRoy, div293Thresh, paygInstalment,
+      rdIncentive, thinCap, litoMax,
+      gbeAusPost, gbeNBN, gbeSnowyHydro, gbeAssetSales, gbeNewCorp, gbeNewCorpSize, gbeNewCorpYield,
+      gbeDefHousing, gbeAnsto, gbeAirservices, gbeMint, gbeAusTrade,
+      reAcqTelstra, reAcqAirports, reAcqPorts, reAcqCommsBank,
+      gbeHousingCorp, gbeHousingCapB, gbeMfgCorp, gbeMfgCapB,
+      gbeCritMin, gbeCritMinCapB, gbeRegBank, gbeRegBankCapB,
+      gbeRewiringCorp, gbeRewiringCapB, gbeFirstNations, gbeFirstNatCapB,
+      // Investment fund levers (Phase 13)
+      ffSalePct, ffDissolve, ffEarlyDraw, ffTargetReturn,
+      mrffSalePct, mrffDissolve, dcafSalePct, dcafDissolve,
+      atsilsffSalePct, atsilsffDissolve, fdfSalePct, fdfDissolve,
+      drfSalePct, drfDissolve, haffSalePct, haffDissolve,
+      cefcSalePct, cefcDissolve, nrfcSalePct, nrfcDissolve]);
+
+  // ── Spending calculation ──────────────────────────────────────────────────
+  // Positive spendChange = more spending = worse for budget.
+  const spendChange = useMemo(() => {
+    let c = 0;
+
+    // Age pension (baseline $68.7B; ~2.6M recipients)
+    c += (pensRate  - 1150) * 0.068;
+    c -= (pensAge   -   67) * 2.5;     // Each year deferral saves ~$2.5B
+    c += (pensAsset -  700) / 100;     // Each $100k raise ≈ $1B
+
+    // Welfare
+    c += (jsRate   -  810) * 0.045;
+    c += (jsCutout - 1390) / 100 * 0.5;
+    c += (dspRate  - 1150) * 0.038;
+    c -= (dspPts   -   20) / 5 * 2.5;
+
+    // Family payments
+    c += (ftbA - 195) * 0.028;
+    c += (ftbB - 170) * 0.013;
+    c += (childcare - 58) / 58 * 17;   // Proportional from $17B baseline (BP1 6.9.3)
+
+    // Health
+    c += (gpBulk   -  91) * 0.13;
+    c += (gpRebate -  44) / 44 * 11;   // Proportional from ~$11B GP MBS baseline
+    c += (hospital - 37.4);             // Direct: each $1B = $1B (NHRA hospital funding)
+    c -= (pbs - 31.60) * 0.05;          // Higher copay = less Cth spending
+    c += (acdc - 0.2);                  // ACDC funding (delta from establishment phase)
+
+    // NDIS: participants × avg cost / 1000 → $B vs $56.16B post-reform baseline (720k × $78k)
+    c += (ndisP * ndisCost / 1000) - 56.16;
+
+    // Aged care (baseline $43.8B residential + in-home combined)
+    c += (inHome - 22000) / 1000 * 0.95;
+    c += (resCare - 70) / 100 * 17;     // Govt share × residential cost base
+
+    // Education (baseline ~$57.3B; ex-HECS one-off)
+    c += (eduPerStu - 7800) / 7800 * 32;
+    c += uniRes - 10.5;
+    c += (uniSub - 45) / 45 * 25;
+    c += regHigherEd;                   // Direct: each $1B = $1B
+
+    // Defence: % of GDP
+    c += (defence - 2.02) / 100 * GDP;
+
+    // Infrastructure (baseline post-slippage adjustment)
+    c += roadRail  - 15.3;
+    c += otherInfra - 8;
+
+    // Public service (baseline 217k civilian ASL)
+    c += (aps - 217) * 0.11;           // Each 1k staff ≈ $110M
+    c += apsWage / 100 * 50;           // Each 1% real raise ≈ $500M on $50B wage bill
+
+    // Climate
+    c += capInv  - 8;
+    c += envProg - 7;
+
+    // Other
+    c += vets     - 12.2;
+    c += aid      - 5.1;
+    c += housingP - 11.4;
+    c += indig    - 6;
+    c += agri     - 5;
+    c += immig    - 5;
+    c += arts     - 2;
+
+    // ── Phase 5 Budget measures (spending side) ──────────────────────────────
+    // Thriving Kids: Cth share of disability supports for under-8s ($B/yr; offset by NDIS savings already in NDIS line).
+    c += thrivingKids;
+
+    // National Foundational Supports: Cth contribution to states (FFR Act 2009 (Cth)).
+    c += (foundSupports - 0.28);
+
+    // Local Infrastructure Fund (housing planning reforms): $262M 2026-27 → $652M 2029-30.
+    c += (localInfraFund - 0.26);
+
+    // Help to Buy expansion: $1.585B in 2026-27 baseline; growing 71%/yr toward maturity.
+    c += (helpToBuyExt - 1.6);
+
+    // Modernising Private Health Insurance: removing age-based rebate uplift = -$3B/4yr ≈ -$0.75B/yr.
+    if (phiReform) c -= 0.75;
+
+    // HELP indexation: lower indexation = more Cth subsidy cost.
+    // Baseline 4% (~CPI). Each 1pp below baseline ≈ $0.4B additional Cth cost (on ~$80B HELP debt stock).
+    c += (4.0 - helpIndexation) * 0.4;
+
+    // ── State & Territory-specific Commonwealth commitments ─────────────────
+    // SA
+    c += (saWhyalla       - 0.121);
+    c += (saHMRB          - 0.012);
+    c += (saNorthernWater - 0.060);
+    // NSW
+    c += (nswWSALink   - 0.350);
+    c += (nswHumeLink  - 0.240);
+    c += (nswM12       - 0.080);
+    // VIC
+    c += (vicSRL          - 2.200);
+    c += (vicGeelongRail  - 0.180);
+    c += (vicYarraRecovery- 0.040);
+    // QLD
+    c += (qldBruceHwy     - 0.700);
+    c += (qldOlympics     - 0.300);
+    c += (qldCopperString - 0.110);
+    // WA
+    c += (waWestport      - 0.080);
+    c += (waMetronet      - 0.260);
+    c += (waPilbaraEnergy - 0.080);
+    // TAS
+    c += (tasMacqPoint    - 0.240);
+    c += (tasBridge       - 0.300);
+    c += (tasFreightEq    - 0.165);
+    // NT
+    c += (ntMiddleArm     - 0.300);
+    c += (ntDefenceDual   - 0.220);
+    // ACT
+    c += (actLightRail    - 0.044);
+    c += (actNatInst      - 0.180);
+
+    // ── Phase 8 spending levers ──────────────────────────────────────────────
+    // Youth Allowance ($/fn). ~200,000 recipients. Each $10/fn ≈ $52M.
+    c += (youthAllow - 640) * 0.0052;
+    // Austudy / ABSTUDY ($/fn). ~50,000 recipients. Each $10/fn ≈ $13M.
+    c += (austudy   - 700) * 0.0013;
+
+    // Health expansions
+    c += dentalVision;                       // Universal dental & vision starts at $0 baseline
+    c += (mentalHealth - 7.4);                // Mental health funding delta
+    c += (indigHealth  - 4.3);                // Indigenous health funding delta
+
+    // Research (split lever)
+    c += (csiroFund   - 1.0);
+    c += (nhmrcFund   - 1.2);
+    c += (arcFund     - 0.8);
+
+    // VET / TAFE — National Skills Agreement Cth contribution
+    c += (vetTafe     - 2.6);
+
+    // Federal policing & borders
+    c += (afp         - 2.4);
+    c += (borderForce - 2.8);
+
+    // Early childhood education
+    c += (earlyChild  - 2.0);
+
+    // ── Nationalisation: SPENDING side — debt service on acquisition ─────────
+    // The matching dividends (revenue) flow to the revenue side. Just-terms
+    // acquisition under s.51(xxxi). Debt service modelled at 4.0% yield on
+    // Commonwealth Government Securities.
+    const NAT_DEBT_YIELD = 0.04;
+    c += 80  * (natLNG     / 100) * NAT_DEBT_YIELD;
+    c += 200 * (natIronOre / 100) * NAT_DEBT_YIELD;
+    c += 30  * (natCoalGen / 100) * NAT_DEBT_YIELD;
+    c += 500 * (natBanking / 100) * NAT_DEBT_YIELD;
+
+    // Commonwealth GBE — new corporation capitalisation cost (spending side)
+    // The annual return is credited to revenue; upfront capitalisation is a
+    // spending outlay under PGPA Act 2013 (Cth) equity injection authority.
+    if (gbeNewCorp) c += gbeNewCorpSize * 0.20; // 20% deployed in budget year
+
+    // Re-acquisition debt service — interest on market-price purchase (4.0% CGS yield)
+    const RAQ_YIELD = 0.04;
+    c += reAcqTelstra   / 100 * 40  * RAQ_YIELD;   // ~$40B Telstra market cap
+    c += reAcqAirports  / 100 * 30  * RAQ_YIELD;   // ~$30B combined airport equity
+    c += reAcqPorts     / 100 * 15  * RAQ_YIELD;   // ~$15B combined port equity
+    c += reAcqCommsBank / 100 * 185 * RAQ_YIELD;   // ~$185B CBA market cap
+
+    // Individual new corporations — 20% capitalisation deployed in budget year (spending)
+    if (gbeHousingCorp)  c += gbeHousingCapB  * 0.20;
+    if (gbeMfgCorp)      c += gbeMfgCapB      * 0.20;
+    if (gbeCritMin)      c += gbeCritMinCapB  * 0.20;
+    if (gbeRegBank)      c += gbeRegBankCapB  * 0.20;
+    if (gbeRewiringCorp) c += gbeRewiringCapB * 0.20;
+    if (gbeFirstNations) c += gbeFirstNatCapB * 0.20;
+
+    // ── Commonwealth Investment Funds (Phase 13) ────────────────────────────
+    // Capital contributions count as spending in the year credited.
+    c += ffContrib + mrffContrib + dcafContrib + atsilsffContrib
+       + fdfContrib + drfContrib + haffContrib;
+    c += cefcContrib + nrfcContrib;
+
+    // Disbursement uplifts vs baseline (each fund's existing disbursement is
+    // already counted in the relevant spending lever — these are *additional*)
+    c += mrffDisburseAdj + dcafDisburseAdj + atsilsffDisburseAdj
+       + fdfDisburseAdj + drfDisburseAdj + haffDisburseAdj;
+
+    // New proposed funds — initial capitalisation deployed at 20% in Year 1
+    // (matches existing GBE convention; remaining 80% capitalised over forward estimates)
+    if (newSoverFund)   c += newSoverFundCapB * 0.20 + newSoverFundContribAnnual;
+    if (newGenFund)     c += newGenFundCapB   * 0.20;
+    if (newInfraFund)   c += newInfraFundCapB * 0.20;
+    if (newDefenceFund) c += newDefenceFundCapB * 0.20;
+
+    return c;
+  }, [pensRate, pensAge, pensAsset, jsRate, jsCutout, dspRate, dspPts, ftbA, ftbB, childcare,
+      gpBulk, gpRebate, hospital, pbs, acdc, ndisP, ndisCost, inHome, resCare,
+      eduPerStu, uniRes, uniSub, regHigherEd, defence, roadRail, otherInfra, aps, apsWage,
+      capInv, envProg, vets, aid, housingP, indig, agri, immig, arts,
+      thrivingKids, foundSupports, localInfraFund, helpToBuyExt, phiReform,
+      helpIndexation,
+      // State & Territory specific commitments
+      saWhyalla, saHMRB, saNorthernWater,
+      nswWSALink, nswHumeLink, nswM12,
+      vicSRL, vicGeelongRail, vicYarraRecovery,
+      qldBruceHwy, qldOlympics, qldCopperString,
+      waWestport, waMetronet, waPilbaraEnergy,
+      tasMacqPoint, tasBridge, tasFreightEq,
+      ntMiddleArm, ntDefenceDual,
+      actLightRail, actNatInst,
+      youthAllow, austudy, dentalVision, mentalHealth, indigHealth,
+      csiroFund, nhmrcFund, arcFund, vetTafe, afp, borderForce, earlyChild,
+      natLNG, natIronOre, natCoalGen, natBanking,
+      gbeNewCorp, gbeNewCorpSize,
+      reAcqTelstra, reAcqAirports, reAcqPorts, reAcqCommsBank,
+      gbeHousingCorp, gbeHousingCapB, gbeMfgCorp, gbeMfgCapB,
+      gbeCritMin, gbeCritMinCapB, gbeRegBank, gbeRegBankCapB,
+      gbeRewiringCorp, gbeRewiringCapB, gbeFirstNations, gbeFirstNatCapB,
+      // Investment fund levers
+      ffContrib, mrffContrib, dcafContrib, atsilsffContrib,
+      fdfContrib, drfContrib, haffContrib, cefcContrib, nrfcContrib,
+      mrffDisburseAdj, dcafDisburseAdj, atsilsffDisburseAdj,
+      fdfDisburseAdj, drfDisburseAdj, haffDisburseAdj,
+      newSoverFund, newSoverFundCapB, newSoverFundContribAnnual,
+      newGenFund, newGenFundCapB, newInfraFund, newInfraFundCapB,
+      newDefenceFund, newDefenceFundCapB]);
+
+  // ── Per-section deltas ────────────────────────────────────────────────────
+  // Each section's contribution to revChange / spendChange. Used for the
+  // colour-coded delta indicator in section headers.
+  const dIncomeTax = useMemo(() =>
+    (calcIncomeTax(brackets) - BASELINE_IT) + (medicare - 2) * (MEDICARE_BASE / 100),
+    [brackets, medicare]);
+  const dCompany = useMemo(() => calcCompanyTax(companyBrackets) - BASELINE_COMPANY
+    + (lossCarry ? -0.5 : 0)    // loss carry-back cost moved here from Phase 5
+    + (!iawo ? 0.3 : 0),        // IAWO abolition revenue moved here from Phase 5
+    [companyBrackets, lossCarry, iawo]);
+  const dGstExempUplift = (gstExFood ? 8.0 : 0) + (gstExHealth ? 6.0 : 0) + (gstExEducation ? 3.0 : 0)
+                       + (gstExChildcare ? 1.0 : 0) + (gstExReligious ? 0.3 : 0) + (gstExCharity ? 0.4 : 0)
+                       + (gstExRentRes ? 4.0 : 0) + (gstExFinancial ? 3.0 : 0)
+                       + (gstExWaterSewer ? 0.5 : 0) + (gstExPrecMetals ? 0.05 : 0);
+  const dGst     = (GST_PASS_THROUGH + (gstRate - 10) * 10.42 + (gstBase ? 20 : 0) + dGstExempUplift) * (gstRetain / 100);
+  const dSuper   = (superEarn - 15) * 2.1 + (superConc - 15) * 1.8 + (superHB - 30) * 0.4;
+  // Interaction-aware budget measure effects (mirrors revChange logic)
+  const negGearNewEffect = negGearNew ? Math.max(0, 0.5 * (1 - negGear / 100)) : 0;
+  const cgtMinTaxEffect  = cgtMinTax  ? Math.max(0, 0.8 * (cgtDisc / 50))      : 0;
+
+  const dCgt     = -(cgtDisc - 50) / 10 * 4.5 + primRes / 100 * 22 + cgtMinTaxEffect;
+  const dNegGear = negGear / 100 * 4 + negGearNewEffect;
+  const dFuel    = fuelImpactDelta(fuel) + evRUC * 0.4 + evSurcharge / 1000 * 0.7
+                 + (hvRUC - 20.6) * 0.20
+                 + (hvRUC > 0 && hvEvDiscount < 100 ? (100 - hvEvDiscount) / 100 * 0.005 : 0)
+                 + (pmc - 70) * 0.030;   // PMC moved here from Phase 5
+  const dTobAlc  = (tobacco - 1.75) * 1.0 + (alcohol - 0.70) / 0.70 * 3;
+  const dRes     = Math.max(0, prrt - 40) * 0.30 + minLevy * 0.75 + lngLevy * 4.3
+                 + gasReserve * 0.05;    // Gas reservation moved here from Phase 5
+  const dFbt     = (fbtRate - 47) * 0.12 + fbtExempt / 100 * 2
+                 + (!fbtEV ? 0.55 : 0) + (!fbtNovated ? 1.10 : 0) + (!fbtRemote ? 0.35 : 0)
+                 + (!fbtEntertainment ? 0.30 : 0) + (!fbtParking ? 0.50 : 0)
+                 + (!fbtChildcareWP ? 0.10 : 0) + (!fbtLaptops ? 0.20 : 0)
+                 + (!fbtLAFHA ? 0.40 : 0) + (!fbtRelocation ? 0.20 : 0)
+                 + (!fbtPBI ? 0.80 : 0) + (!fbtReligious ? 0.05 : 0);
+  const dTrusts  = trustMinTaxRate / 30 * 1.2
+                 + (trustBucketCo ? 0.6 : 0) + (trustS99B ? 0.3 : 0) + (trustLossRecoup ? 0.4 : 0)
+                 + (trustFTE ? 0.5 : 0) + (trustStreaming ? 0.7 : 0) + (trustCgtDisc ? 1.5 : 0);
+  const dNewTax  = (lvt > 0 ? lvt * 66 : 0)
+                 + (carbon > 0 ? (carbon <= 30 ? carbon / 30 * 4 : carbon <= 75 ? 4 + (carbon - 30) / 45 * 5 : 9 + (carbon - 75) / 75 * 4) : 0)
+                 + estate / 20 * 7
+                 + (wealth > 0 ? (wealth <= 1 ? wealth * 6 : 6 + (wealth - 1) * 4) : 0)
+                 + (finTax > 0 ? (finTax <= 0.1 ? finTax / 0.1 : 1 + (finTax - 0.1) / 0.4 * 3) : 0);
+  const dOtherTax = customs / 100 * 7.3 + (luxCar - 33) * 0.03 + (wineEq - 29) * 0.035
+                  + -(wato / 250) * 1.6;  // WATO moved here from Phase 5 (income-adjacent measure)
+  // (dPhase5Tax removed — all measures folded into parent section deltas:
+  //  lossCarry/iawo → dCompany; negGearNew → dNegGear; cgtMinTax → dCgt;
+  //  pmc → dOtherTax above; gasReserve → dRes; wato → dOtherTax above.)
+  const dEnvHealth = (plasticExcise > 0 ? (plasticExcise <= 2 ? plasticExcise * 1.5 : 3.0 + (plasticExcise - 2) * 0.6) : 0)
+                   + (sugarLevy > 0 ? (sugarLevy <= 20 ? sugarLevy / 10 * 1.5 : 3.0 + (sugarLevy - 20) / 10 * 0.6) : 0)
+                   + (singleUsePlastic > 0 ? singleUsePlastic * 0.5 : 0)
+                   + (eWasteLevy > 0 ? eWasteLevy / 10 * 0.1 : 0)
+                   + (tyreLevy > 0 ? tyreLevy * 0.025 : 0)
+                   + (gamblingLevy > 0 ? gamblingLevy / 10 * 1.5 : 0)
+                   + (vapesExcise > 0 ? vapesExcise * 0.25 : 0)
+                   + (alcoholHealth > 0 ? alcoholHealth / 10 * 0.5 : 0)
+                   + (airEmissions > 0 ? airEmissions / 50 * 0.6 : 0)
+                   + (batteryLevy > 0 ? batteryLevy / 5 * 0.1 : 0);
+  const dDigMono   = (digitalSvc > 0 ? (digitalSvc <= 5 ? digitalSvc * 0.5 : 2.5 + (digitalSvc - 5) * 0.2) : 0)
+                   + (monopolyLevy > 0 ? (monopolyLevy <= 10 ? monopolyLevy * 0.3 : 3.0 + (monopolyLevy - 10) * 0.15) : 0);
+  // Nationalisation: revenue side shows GROSS dividends; debt service is on spending side
+  const dNatRev = natLNG / 100 * 10 + natIronOre / 100 * 20 + natCoalGen / 100 * 0.5 + natBanking / 100 * 25;
+  const NAT_YIELD_DISP = 0.04;
+  const dNatCost = (80 * natLNG/100 + 200 * natIronOre/100 + 30 * natCoalGen/100 + 500 * natBanking/100) * NAT_YIELD_DISP;
+  const dNat = dNatRev - dNatCost;
+
+  // Phase 10 section deltas
+  const ftcBaseDelta = 10.7 * (1 - ftcRate / 100)
+    + (!ftcMining && ftcRate === 100 ? 8.0 : 0)
+    + (!ftcAg    && ftcRate === 100 ? 1.5 : 0);
+  const dFtcMls = ftcBaseDelta
+    + (93000 - mlsThreshold) / 10000 * 0.08
+    + (mlsRate - 1.0) / 0.1 * 0.09;
+  const dWithhold = (withholdDiv - 30) * 0.15 + (withholdInt - 10) * 0.08 + (withholdRoy - 30) * 0.10;
+  const dOtherTaxNew = (250 - div293Thresh) / 10 * 0.07
+    + paygInstalment * 0.2
+    + (43.5 - rdIncentive) * 0.05
+    + (thinCap ? 0.4 : 0)
+    - (litoMax - 700) / 100 * 0.7;
+  const dGbe = gbeAusPost / 1000 + gbeNBN / 1000 + gbeSnowyHydro / 1000
+    + gbeAssetSales / 10
+    + (gbeNewCorp ? gbeNewCorpSize * (gbeNewCorpYield / 100) * 0.5 - gbeNewCorpSize * 0.20 : 0)
+    + gbeDefHousing / 1000 + gbeAnsto / 1000 + gbeAirservices / 1000 + gbeMint / 1000 + gbeAusTrade / 1000
+    // Re-acquisition net (dividend - debt service)
+    + reAcqTelstra   / 100 * (1.6  - 40  * 0.04)
+    + reAcqAirports  / 100 * (1.2  - 30  * 0.04)
+    + reAcqPorts     / 100 * (0.5  - 15  * 0.04)
+    + reAcqCommsBank / 100 * (9.0  - 185 * 0.04)
+    // Individual new corps (net: 50% yield realised − 20% capex deployed)
+    + (gbeHousingCorp  ? gbeHousingCapB  * (0.045 * 0.5 - 0.20) : 0)
+    + (gbeMfgCorp      ? gbeMfgCapB      * (0.070 * 0.5 - 0.20) : 0)
+    + (gbeCritMin      ? gbeCritMinCapB  * (0.090 * 0.5 - 0.20) : 0)
+    + (gbeRegBank      ? gbeRegBankCapB  * (0.060 * 0.5 - 0.20) : 0)
+    + (gbeRewiringCorp ? gbeRewiringCapB * (0.055 * 0.5 - 0.20) : 0)
+    + (gbeFirstNations ? gbeFirstNatCapB * (0.080 * 0.5 - 0.20) : 0);
+
+  // Spending section deltas
+  const dPension  = (pensRate - 1150) * 0.068 - (pensAge - 67) * 2.5 + (pensAsset - 700) / 100;
+  const dWelfare  = (jsRate - 810) * 0.045 + (jsCutout - 1390) / 100 * 0.5
+                  + (dspRate - 1150) * 0.038 - (dspPts - 20) / 5 * 2.5
+                  + (ftbA - 195) * 0.028 + (ftbB - 170) * 0.013
+                  + (childcare - 58) / 58 * 17
+                  + (youthAllow - 640) * 0.0052 + (austudy - 700) * 0.0013;
+  // dHealth now includes phiReform saving — defined below alongside other redistributed deltas
+  // dNdis is now dNdisFull (Thriving Kids + Foundational Supports folded in; see below)
+  const dAgedCare = (inHome - 22000) / 1000 * 0.95 + (resCare - 70) / 100 * 17;
+  const dEdu      = (eduPerStu - 7800) / 7800 * 32 + (uniRes - 10.5) + (uniSub - 45) / 45 * 25
+                  + regHigherEd + (csiroFund - 1.0) + (nhmrcFund - 1.2) + (arcFund - 0.8)
+                  + (vetTafe - 2.6) + (earlyChild - 2.0);
+  const dDefence  = (defence - 2.02) / 100 * GDP;
+  const dInfra    = (roadRail - 15.3) + (otherInfra - 8) + (localInfraFund - 0.26); // local infra fund folded in
+  const dAps      = (aps - 217) * 0.11 + apsWage / 100 * 50;
+  const dClimate  = (capInv - 8) + (envProg - 7);
+  const dOtherSp  = (vets - 12.2) + (aid - 5.1) + (housingP - 11.4) + (indig - 6) + (agri - 5)
+                  + (immig - 5) + (arts - 2) + (afp - 2.4) + (borderForce - 2.8)
+                  + (helpToBuyExt - 1.6);  // Help to Buy folded into housing section
+  const dNdisFull = (ndisP * ndisCost / 1000) - 56.16
+                  + thrivingKids           // Thriving Kids directly offsets NDIS trajectory
+                  + (foundSupports - 0.28); // Foundational Supports folded into NDIS section
+  // (dPhase5Sp removed — all measures distributed into their parent section deltas.)
+  const dHealth   = (gpBulk - 91) * 0.13 + (gpRebate - 44) / 44 * 11
+                  + (hospital - 37.4) - (pbs - 31.60) * 0.05 + (acdc - 0.2)
+                  + dentalVision + (mentalHealth - 7.4) + (indigHealth - 4.3)
+                  + (phiReform ? -0.75 : 0); // PHI reform saving folded into health
+  const dHigherEd = (4.0 - helpIndexation) * 0.4;
+  // State & Territory-specific commitments delta (renamed from dSa to dStates)
+  const dStates = (saWhyalla - 0.121) + (saHMRB - 0.012) + (saNorthernWater - 0.060)
+                + (nswWSALink - 0.350) + (nswHumeLink - 0.240) + (nswM12 - 0.080)
+                + (vicSRL - 2.200) + (vicGeelongRail - 0.180) + (vicYarraRecovery - 0.040)
+                + (qldBruceHwy - 0.700) + (qldOlympics - 0.300) + (qldCopperString - 0.110)
+                + (waWestport - 0.080) + (waMetronet - 0.260) + (waPilbaraEnergy - 0.080)
+                + (tasMacqPoint - 0.240) + (tasBridge - 0.300) + (tasFreightEq - 0.165)
+                + (ntMiddleArm - 0.300) + (ntDefenceDual - 0.220)
+                + (actLightRail - 0.044) + (actNatInst - 0.180);
+
+  // Commonwealth Investment Funds delta (Phase 13). Sign convention: positive
+  // = improves budget balance (revenue exceeds spending). Sales/dissolutions
+  // are large one-off revenue; contributions are ongoing spending.
+  // delta = (sales+dissolutions revenue) − (contributions+disbursement adj+new fund capex)
+  const fundSaleAmt = (aum, salePct, dissolve) => dissolve ? aum : (aum * salePct / 100);
+  const dFunds =
+    // Sales/dissolution revenue (positive — improves UCB)
+    fundSaleAmt(AUM_FUTURE_FUND, ffSalePct, ffDissolve)
+    + fundSaleAmt(AUM_MRFF,      mrffSalePct, mrffDissolve)
+    + fundSaleAmt(AUM_DCAF,      dcafSalePct, dcafDissolve)
+    + fundSaleAmt(AUM_ATSILSFF,  atsilsffSalePct, atsilsffDissolve)
+    + fundSaleAmt(AUM_FDF,       fdfSalePct, fdfDissolve)
+    + fundSaleAmt(AUM_DRF,       drfSalePct, drfDissolve)
+    + fundSaleAmt(AUM_HAFF,      haffSalePct, haffDissolve)
+    + fundSaleAmt(AUM_CEFC,      cefcSalePct, cefcDissolve)
+    + fundSaleAmt(AUM_NRFC,      nrfcSalePct, nrfcDissolve)
+    + ffEarlyDraw
+    + AUM_FUTURE_FUND * (1 - ffSalePct / 100) * (ffDissolve ? 0 : 1) * Math.max(0, ffTargetReturn - 3) / 100 * 0.5
+    // Contributions and disbursement adjustments (negative — worsen UCB)
+    - (ffContrib + mrffContrib + dcafContrib + atsilsffContrib + fdfContrib + drfContrib + haffContrib)
+    - (cefcContrib + nrfcContrib)
+    - (mrffDisburseAdj + dcafDisburseAdj + atsilsffDisburseAdj + fdfDisburseAdj + drfDisburseAdj + haffDisburseAdj)
+    - (newSoverFund   ? newSoverFundCapB * 0.20 + newSoverFundContribAnnual : 0)
+    - (newGenFund     ? newGenFundCapB   * 0.20 : 0)
+    - (newInfraFund   ? newInfraFundCapB * 0.20 : 0)
+    - (newDefenceFund ? newDefenceFundCapB * 0.20 : 0);
+
+  // ── Scorecard ─────────────────────────────────────────────────────────────
+  // Each dimension is scored 0-100 and given a grade A-F.
+  // Scores are intentionally opinionated but grounded in mainstream economic
+  // and policy benchmarks. Positive revChange = more revenue = revenue-raising.
+  // The scorecard is a heuristic tool — not a formal economic model.
+  const scorecard = useMemo(() => {
+    const bal = BASELINE_DEFICIT + revChange - spendChange;
+    const balPctGdp = bal / GDP * 100;
+    const totalRev  = BASELINE_RECEIPTS + revChange;
+    const totalSpend= BASELINE_PAYMENTS + spendChange;
+    const revPctGdp = totalRev  / GDP * 100;
+    const spPctGdp  = totalSpend / GDP * 100;
+
+    // Helper: clamp 0-100
+    const clamp = (v) => Math.max(0, Math.min(100, v));
+
+    // Helper: letter grade from score
+    const letterGrade = (s) => {
+      if (s >= 85) return "A";
+      if (s >= 70) return "B";
+      if (s >= 55) return "C";
+      if (s >= 40) return "D";
+      if (s >= 20) return "E";
+      return "F";
+    };
+
+    // 1. FISCAL SUSTAINABILITY — scored on balance + debt trajectory
+    // Benchmark: OECD median general-govt balance ≈ -2% GDP; surplus = excellent.
+    // Each 1pp above -1% GDP costs 10 points; each 1pp below -4% GDP costs 15 pts.
+    let fiscalScore = 70;
+    if (balPctGdp >= 0)    fiscalScore = clamp(100 + balPctGdp * 5);
+    else if (balPctGdp >= -1) fiscalScore = clamp(70 + balPctGdp * 30);
+    else if (balPctGdp >= -3) fiscalScore = clamp(70 - (balPctGdp + 1) * 20);
+    else fiscalScore = clamp(30 - (balPctGdp + 3) * 10);
+    // Debt path penalty: each 1pp additional gross debt/GDP − 5 pts
+    const approxDebt2030 = 34.0 + Math.max(0, (spendChange - revChange) * 5 / GDP * 100);
+    if (approxDebt2030 > 36) fiscalScore = clamp(fiscalScore - (approxDebt2030 - 36) * 5);
+
+    // 2. DISTRIBUTIONAL EQUITY — how progressive or regressive are the changes?
+    // Scored on: income tax progressivity, welfare generosity vs cuts,
+    // CGT/negative gearing reform, GST exemption decisions.
+    let equityScore = 50; // neutral baseline
+    // Income tax: higher top rates → more progressive
+    const topRate = [...brackets].sort((a, b) => b.min - a.min)[0]?.rate ?? 45;
+    equityScore += clamp((topRate - 45) * 2);   // above current top → more progressive
+    // Company progressive brackets: top bracket > 30% is moderately progressive
+    const topCoRate = [...companyBrackets].sort((a, b) => b.min - a.min)[0]?.rate ?? 30;
+    equityScore += clamp((topCoRate - 30) * 0.5);
+    // Welfare: JobSeeker rate above baseline
+    equityScore += clamp((jsRate - 810) / 50 * 5);
+    // CGT reform (removing discount): more progressive
+    equityScore += (cgtDisc < 50) ? clamp((50 - cgtDisc) / 5 * 2) : 0;
+    // Negative gearing reform
+    equityScore += negGear > 0 ? clamp(negGear / 10) : 0;
+    // GST removal of food exemption: regressive
+    if (gstExFood) equityScore -= 15;
+    if (gstExHealth) equityScore -= 10;
+    // FBT PBI removal: regressive for healthcare workers
+    if (!fbtPBI) equityScore -= 8;
+    // Pension rate: higher = more equitable
+    equityScore += clamp((pensRate - 1150) / 50 * 3);
+    // LITO: higher LITO benefits low-income earners
+    equityScore += clamp((litoMax - 700) / 100 * 2);
+    equityScore = clamp(equityScore);
+
+    // 3. ECONOMIC EFFICIENCY — distortions, incentives, long-run growth
+    // Higher taxes on labour/consumption generally more efficient than
+    // on capital formation. LVT is the most efficient. FBT/trust reform good.
+    let efficiencyScore = 50;
+    // LVT: most efficient tax — large bonus
+    efficiencyScore += lvt > 0 ? clamp(lvt * 20) : 0;
+    // Carbon price: corrects externality — efficient up to ~$75/t
+    efficiencyScore += carbon > 0 && carbon <= 75 ? clamp(carbon / 75 * 15) : (carbon > 75 ? 15 - (carbon-75)/75*5 : 0);
+    // R&D incentive: lower rates = less efficient subsidy but less distortion
+    // Optimal R&D rate is positive — removing entirely bad; current 43.5% good
+    efficiencyScore += rdIncentive >= 30 && rdIncentive <= 45 ? 5 : (rdIncentive < 30 ? -5 : 0);
+    // FBT exemptions: removal improves neutrality
+    efficiencyScore += !fbtParking ? 3 : 0;
+    efficiencyScore += !fbtEntertainment ? 2 : 0;
+    // Trust reforms reduce distortions (dTrusts computed inline)
+    const trustDelta = trustMinTaxRate / 30 * 1.2
+      + (trustBucketCo ? 0.6 : 0) + (trustS99B ? 0.3 : 0) + (trustLossRecoup ? 0.4 : 0)
+      + (trustFTE ? 0.5 : 0) + (trustStreaming ? 0.7 : 0) + (trustCgtDisc ? 1.5 : 0);
+    efficiencyScore += trustDelta > 0 ? clamp(trustDelta * 3) : 0;
+    // GST rate: broad-based consumption tax efficient; rate increase moderately good
+    efficiencyScore += (gstRate - 10) * 2;
+    // Thin-cap tightening: reduces distortion from debt bias
+    if (thinCap) efficiencyScore += 3;
+    // FTC reduction: mining FTC is market distortion; compute inline
+    const ftcDeltaInner = 10.7 * (1 - ftcRate / 100)
+      + (!ftcMining && ftcRate === 100 ? 8.0 : 0)
+      + (!ftcAg    && ftcRate === 100 ? 1.5 : 0);
+    efficiencyScore += ftcDeltaInner > 0 ? clamp(ftcDeltaInner * 2) : 0;
+    // High income tax rates penalise efficiency above ~50%
+    if (topRate > 55) efficiencyScore -= (topRate - 55) * 1.5;    efficiencyScore = clamp(efficiencyScore);
+
+    // 4. ENVIRONMENTAL IMPACT — net green/brown of the scenario
+    let envScore = 50;
+    // Carbon price: big positive
+    envScore += carbon > 0 ? clamp(carbon / 75 * 30) : 0;
+    // Fuel excise increase (less subsidised fossil fuels)
+    envScore += fuel > 50.8 ? clamp((fuel - 50.8) * 3) : (fuel < 50.8 ? -(50.8 - fuel) * 3 : 0);
+    // FTC reduction: reducing fossil fuel subsidy
+    envScore += ftcDeltaInner > 0 ? clamp(ftcDeltaInner * 4) : 0;
+    // Air emissions levy
+    envScore += airEmissions > 0 ? clamp(airEmissions / 50 * 10) : 0;
+    // HVRUC EV discount removal: reduces EV advantage → slightly negative
+    if (hvEvDiscount < 100) envScore -= (100 - hvEvDiscount) / 100 * 5;
+    // Climate spending
+    envScore += (capInv - 8) > 0 ? clamp((capInv - 8) * 3) : 0;
+    envScore += (envProg - 7) > 0 ? clamp((envProg - 7) * 3) : 0;
+    // EV FBT exemption removal: slightly negative for EV uptake
+    if (!fbtEV) envScore -= 5;
+    // Plastic/e-waste/battery levies
+    envScore += plasticExcise > 0 ? 3 : 0;
+    envScore += singleUsePlastic > 0 ? 2 : 0;
+    envScore += batteryLevy > 0 ? 2 : 0;
+    envScore = clamp(envScore);
+
+    // 5. SOCIAL IMPACT — health, education, welfare, services
+    let socialScore = 50;
+    socialScore += clamp((hospital - 37.4) * 3);
+    socialScore += clamp((gpBulk - 91) * 2);
+    socialScore += dentalVision > 0 ? clamp(dentalVision * 5) : 0;
+    socialScore += (mentalHealth - 7.4) > 0 ? clamp((mentalHealth - 7.4) * 5) : 0;
+    socialScore += clamp((eduPerStu - 7800) / 200 * 2);
+    socialScore += (uniSub - 45) > 0 ? clamp((uniSub - 45) * 0.5) : 0;
+    socialScore += (jsRate - 810) > 0 ? clamp((jsRate - 810) / 10) : -(810 - jsRate) / 10;
+    socialScore += (pensRate - 1150) > 0 ? clamp((pensRate - 1150) / 20) : 0;
+    socialScore += housingP > 11.4 ? clamp((housingP - 11.4) * 3) : 0;
+    socialScore += indig > 6 ? clamp((indig - 6) * 5) : 0;
+    // NDIS: larger if above baseline but watch fiscal sustainability
+    const ndisTotal = ndisP * ndisCost / 1000;
+    socialScore += ndisTotal > 56.16 ? clamp((ndisTotal - 56.16) * 2) : 0;
+    socialScore = clamp(socialScore);
+
+    // 6. POLITICAL FEASIBILITY — a blunt heuristic of how politically passable the mix is
+    // Major politically difficult measures reduce the score.
+    let feasScore = 80;
+    if (primRes > 0)       feasScore -= clamp(primRes / 5);           // Main residence CGT — very toxic
+    if (lvt > 0.5)         feasScore -= clamp((lvt - 0.5) * 15);      // LVT — politically extreme
+    if (estate > 10)       feasScore -= clamp((estate - 10) * 2);     // Estate tax — significant resistance
+    if (gstExFood)         feasScore -= 20;                            // Taxing food — politically radioactive
+    if (pensAge > 67)      feasScore -= (pensAge - 67) * 8;           // Pension age — electorally costly
+    if (natBanking > 0)    feasScore -= clamp(natBanking * 0.8);      // Bank nationalisation — extreme
+    if (gstBase)           feasScore -= 12;
+    if (!fbtPBI)           feasScore -= 10;                            // PBI — hospital/aged-care worker impact
+    if (negGear > 0)       feasScore -= clamp(negGear / 5);           // Neg gearing — property lobby
+    if (carbon > 50)       feasScore -= clamp((carbon - 50) / 5);     // High carbon price — business lobby
+    if (wealth > 0)        feasScore -= clamp(wealth * 10);
+    // GBE new corp: moderately feasible
+    if (gbeNewCorp)        feasScore += 5;
+    // Raising basic rate thresholds (LITO increase): popular
+    if (litoMax > 700)     feasScore += clamp((litoMax - 700) / 100 * 3);
+    feasScore = clamp(feasScore);
+
+    const dimensions = [
+      { key: "fiscal",      label: "Fiscal sustainability", score: fiscalScore,    desc: `Balance: ${bal >= 0 ? "+" : ""}${bal.toFixed(1)}B (${balPctGdp.toFixed(2)}% GDP)` },
+      { key: "equity",      label: "Distributional equity", score: equityScore,    desc: `Progressive/regressive mix of revenue and spending changes` },
+      { key: "efficiency",  label: "Economic efficiency",   score: efficiencyScore, desc: `Incentive and distortion effects across all measures` },
+      { key: "environment", label: "Environmental impact",  score: envScore,       desc: `Net effect on emissions, fossil fuel subsidies, and green transition` },
+      { key: "social",      label: "Social impact",         score: socialScore,    desc: `Health, education, welfare, housing, and services investment` },
+      { key: "feasibility", label: "Political feasibility", score: feasScore,      desc: `Estimated passage likelihood through Parliament and electoral palatability` },
+    ];
+
+    const overall = Math.round(dimensions.reduce((s, d) => s + d.score, 0) / dimensions.length);
+
+    return { dimensions, overall, grade: letterGrade(overall), bal, balPctGdp, totalRev, totalSpend, revPctGdp, spPctGdp, letterGrade };
+  }, [revChange, spendChange, brackets, companyBrackets, jsRate, cgtDisc, negGear, pensRate,
+      gstExFood, gstExHealth, fbtPBI, fbtParking, fbtEntertainment, fbtEV, litoMax,
+      lvt, carbon, fuel, ftcRate, ftcMining, ftcAg,
+      airEmissions, hvEvDiscount, capInv, envProg,
+      plasticExcise, singleUsePlastic, batteryLevy,
+      hospital, gpBulk, dentalVision, mentalHealth, eduPerStu, uniSub,
+      housingP, indig, ndisP, ndisCost, primRes, estate, gstBase, pensAge, natBanking,
+      gbeNewCorp, wealth, rdIncentive, thinCap, trustMinTaxRate, trustBucketCo,
+      trustS99B, trustLossRecoup, trustFTE, trustStreaming, trustCgtDisc,
+      companyBrackets, gstRate, thinCap]);
+  const balance      = BASELINE_DEFICIT + revChange - spendChange;
+  const totalRev     = BASELINE_RECEIPTS + revChange;
+  const totalSpend   = BASELINE_PAYMENTS + spendChange;
+  const [gr, gc]     = grade(balance);
+  const barPct       = Math.max(0, Math.min(100, (balance + 80) / 140 * 100));
+
+  // Effective tax calculator
+  const taxAtCalcInc = calcTaxForIncome(calcInc, brackets);
+  const effRate      = calcInc > 0 ? (taxAtCalcInc / calcInc * 100) : 0;
+  const sorted       = [...brackets].sort((a, b) => a.min - b.min);
+  const margBracket  = sorted.slice().reverse().find(b => calcInc > b.min);
+  const margRate     = margBracket ? margBracket.rate : 0;
+  const itDelta      = calcIncomeTax(brackets) - BASELINE_IT;
+
+  // Implied GST flows for display
+  const gstExempUpliftDisplay = (gstExFood ? 8.0 : 0) + (gstExHealth ? 6.0 : 0) + (gstExEducation ? 3.0 : 0)
+                              + (gstExChildcare ? 1.0 : 0) + (gstExReligious ? 0.3 : 0) + (gstExCharity ? 0.4 : 0)
+                              + (gstExRentRes ? 4.0 : 0) + (gstExFinancial ? 3.0 : 0)
+                              + (gstExWaterSewer ? 0.5 : 0) + (gstExPrecMetals ? 0.05 : 0);
+  const gstTotalFlow = GST_PASS_THROUGH + (gstRate - 10) * 10.42 + (gstBase ? 20 : 0) + gstExempUpliftDisplay;
+  const gstToStates  = gstTotalFlow * (1 - gstRetain / 100);
+  const gstKeptByCth = gstTotalFlow * (gstRetain / 100);
+
+  // ── Multi-year forward estimates projection ───────────────────────────────
+  // Project the user's single-year deltas across the 5-year horizon.
+  //
+  // Method: revenue and spending changes are treated as policy settings that
+  // persist in real terms. Each year's nominal delta scales with nominal GDP
+  // growth from the budget year (~4-5%/yr). Debt-interest cascade is modelled:
+  // cumulative improvements lower the debt stock and therefore lower interest
+  // costs in subsequent years (assumed avg yield ~4.0% on outstanding gross debt).
+  //
+  // Limitations: program-specific CAGR effects (e.g., a flat NDIS savings turning
+  // into compounding savings as the baseline grows) are approximated rather than
+  // computed lever-by-lever. Future passes can refine each lever's projection rule.
+  const forwardEstimates = useMemo(() => {
+    const AVG_DEBT_YIELD = 0.040;  // ~4% on Cth Government Securities (BP1 sheet 8.14)
+    const rows = [];
+    let cumImprovement = 0;        // running $B improvement vs baseline
+    let cumPdiSavings  = 0;        // running $B avoided interest from earlier savings
+
+    for (let i = 0; i < FORWARD.years.length; i++) {
+      const gdpScale     = FORWARD.gdp[i] / FORWARD.gdp[0];
+      const yearRev      = revChange   * gdpScale;
+      const yearSpend    = spendChange * gdpScale;
+      const baselineUcb  = FORWARD.ucbPct[i] * FORWARD.gdp[i] / 100;     // $B
+      const baselineDebt = FORWARD.grossDebtPct[i] * FORWARD.gdp[i] / 100;
+      const baselinePdi  = FORWARD.pdi[i];
+
+      // Interest saving in year i comes from cumulative improvements achieved
+      // before year i began (those are what lowered the opening debt stock).
+      const pdiSaving    = cumImprovement * AVG_DEBT_YIELD;
+      cumPdiSavings     += pdiSaving;
+
+      const yearNet      = yearRev - yearSpend + pdiSaving;
+      const userUcb      = baselineUcb + yearNet;
+      cumImprovement    += yearNet;
+      const userDebt     = baselineDebt - cumImprovement;
+      const userPdi      = baselinePdi  - cumPdiSavings;
+
+      rows.push({
+        year:           FORWARD.years[i],
+        gdp:            FORWARD.gdp[i],
+        baselineUcb,
+        baselineUcbPct: FORWARD.ucbPct[i],
+        userUcb,
+        userUcbPct:     userUcb / FORWARD.gdp[i] * 100,
+        baselineDebt,
+        baselineDebtPct:FORWARD.grossDebtPct[i],
+        userDebt,
+        userDebtPct:    userDebt / FORWARD.gdp[i] * 100,
+        baselinePdi,
+        userPdi,
+        yearNet,
+        cumImprovement,
+        structural:     FORWARD.structPct[i],
+        cyclical:       FORWARD.cyclicalPct[i],
+      });
+    }
+    return rows;
+  }, [revChange, spendChange]);
+
+  // Cumulative 5-year deficit improvement (sum of yearly nets, in $B)
+  const cumulativeImprovement = forwardEstimates[forwardEstimates.length - 1].cumImprovement;
+  const cumulativePdiSaving   = forwardEstimates.reduce((s, r) => s + (r.baselinePdi - r.userPdi), 0);
+
+  // ── Copy Inputs ─────────────────────────────────────────────────────────────
+  // Produces a human-readable text diff of all changed levers vs the 2026-27
+  // Budget baseline, grouped by section. Copied to clipboard with a fallback
+  // path via document.execCommand for sandboxed iframe contexts.
+  const copyInputs = () => {
+    const sections = {};
+    const add = (sec, text) => {
+      if (!sections[sec]) sections[sec] = [];
+      sections[sec].push(text);
+    };
+
+    // ── Brackets helper (compare arrays of {min,max,rate}) ─────────────
+    const bracketsDiff = (current, defaults) => {
+      const sortedC = [...current].sort((a, b) => a.min - b.min);
+      const sortedD = [...defaults].sort((a, b) => a.min - b.min);
+      if (sortedC.length !== sortedD.length) return true;
+      return sortedC.some((b, i) =>
+        b.min !== sortedD[i].min || b.max !== sortedD[i].max || b.rate !== sortedD[i].rate
+      );
+    };
+    const fmtBracket = b =>
+      `${b.min === 0 ? '$0' : '$' + b.min.toLocaleString()}–${b.max === Infinity ? '∞' : '$' + b.max.toLocaleString()} @ ${b.rate}%`;
+    const fmtBracketArray = arr =>
+      [...arr].sort((a, b) => a.min - b.min).map(fmtBracket).join('; ');
+
+    // ── 1. Income Tax ───────────────────────────────────────────────────
+    if (bracketsDiff(brackets, DEFAULT_BRACKETS)) {
+      add('1. Progressive Income Tax', `Brackets: ${fmtBracketArray(brackets)}`);
+    }
+    if (medicare !== 2)   add('1. Progressive Income Tax', `Medicare levy: ${medicare}% (default 2%)`);
+    if (litoMax !== 700)  add('1. Progressive Income Tax', `LITO maximum: $${litoMax} (default $700)`);
+
+    // ── 2. Company Tax ──────────────────────────────────────────────────
+    if (bracketsDiff(companyBrackets, DEFAULT_COMPANY_BRACKETS)) {
+      add('2. Company Tax', `Brackets: ${fmtBracketArray(companyBrackets)}`);
+    }
+    if (lossCarry)        add('2. Company Tax', 'Small company loss carry-back: ON (Budget measure)');
+    if (!iawo)            add('2. Company Tax', '$20k instant asset write-off: ABOLISHED (default: permanent)');
+
+    // ── 3. GST ──────────────────────────────────────────────────────────
+    if (gstRate !== 10)   add('3. GST', `Rate: ${gstRate}% (default 10%)`);
+    if (gstBase)          add('3. GST', 'Legacy bulk-expand (food+health+education): ON');
+    if (gstRetain !== 0)  add('3. GST', `Cth retention share: ${gstRetain}% (default 0% — all passes to states)`);
+    [
+      ['gstExFood', gstExFood, 'fresh food'],
+      ['gstExHealth', gstExHealth, 'health services'],
+      ['gstExEducation', gstExEducation, 'education services'],
+      ['gstExChildcare', gstExChildcare, 'childcare'],
+      ['gstExReligious', gstExReligious, 'religious services'],
+      ['gstExCharity', gstExCharity, 'charity non-commercial activities'],
+      ['gstExRentRes', gstExRentRes, 'residential rent'],
+      ['gstExFinancial', gstExFinancial, 'financial supplies'],
+      ['gstExWaterSewer', gstExWaterSewer, 'water/sewerage'],
+      ['gstExPrecMetals', gstExPrecMetals, 'precious metals'],
+    ].forEach(([, on, label]) => {
+      if (on) add('3. GST', `${label}: now subject to GST`);
+    });
+
+    // ── 4. Superannuation ───────────────────────────────────────────────
+    if (superEarn !== 15) add('4. Superannuation', `Earnings tax: ${superEarn}% (default 15%)`);
+    if (superConc !== 15) add('4. Superannuation', `Concessional contributions tax: ${superConc}% (default 15%)`);
+    if (superHB   !== 30) add('4. Superannuation', `Div 296 high-balance surcharge: ${superHB}% (default 30%)`);
+
+    // ── 5. CGT ──────────────────────────────────────────────────────────
+    if (cgtDisc !== 50)   add('5. Capital Gains Tax', `Discount: ${cgtDisc}% (default 50%)`);
+    if (primRes !== 0)    add('5. Capital Gains Tax', `Primary residence % taxed: ${primRes}% (default 0% — exempt)`);
+    if (cgtMinTax)        add('5. Capital Gains Tax', 'CGT indexation + 30% minimum: ON (Budget measure)');
+
+    // ── 6. Negative Gearing ─────────────────────────────────────────────
+    if (negGear !== 0)    add('6. Negative Gearing', `Ring-fence: ${negGear}% (default 0% — unrestricted)`);
+    if (negGearNew)       add('6. Negative Gearing', 'Restricted to new builds only: ON (Budget measure)');
+
+    // ── 7. Fuel ─────────────────────────────────────────────────────────
+    if (fuel !== 50.8)    add('7. Fuel Excise', `Rate: ${fuel.toFixed(1)}¢/L (default 50.8¢/L)`);
+    if (evRUC !== 0)      add('7. Fuel Excise', `EV road user charge: ${evRUC}¢/km`);
+    if (evSurcharge !== 0)add('7. Fuel Excise', `EV registration surcharge: $${evSurcharge}/yr`);
+    if (hvRUC !== 20.6)   add('7. Fuel Excise', `Heavy vehicle RUC: ${hvRUC.toFixed(1)}¢/L (default 20.6¢/L)`);
+    if (hvEvDiscount !== 100) add('7. Fuel Excise', `EV truck HVRUC discount: ${hvEvDiscount}% (default 100% — exempt)`);
+    if (pmc !== 70)       add('7. Fuel Excise', `Passenger Movement Charge: $${pmc} (default $70)`);
+
+    // ── 8. Tobacco & Alcohol ────────────────────────────────────────────
+    if (tobacco !== 1.75) add('8. Tobacco & Alcohol', `Tobacco excise: $${tobacco.toFixed(2)}/stick (default $1.75)`);
+    if (alcohol !== 0.70) add('8. Tobacco & Alcohol', `Alcohol excise: $${alcohol.toFixed(2)}/std drink (default $0.70)`);
+
+    // ── 9. Resource & Mining ────────────────────────────────────────────
+    if (prrt !== 40)      add('9. Resource & Mining', `PRRT: ${prrt}% (default 40%)`);
+    if (minLevy !== 0)    add('9. Resource & Mining', `Mineral resources levy: ${minLevy}%`);
+    if (lngLevy !== 0)    add('9. Resource & Mining', `LNG export levy: $${lngLevy}/GJ`);
+    if (gasReserve !== 0) add('9. Resource & Mining', `Domestic gas reservation: ${gasReserve}% of exports`);
+
+    // ── 10. FBT ─────────────────────────────────────────────────────────
+    if (fbtRate !== 47)   add('10. FBT', `Rate: ${fbtRate}% (default 47%)`);
+    if (fbtExempt !== 0)  add('10. FBT', `Bulk exemption sweep: ${fbtExempt}% removed`);
+    [
+      ['fbtEV', fbtEV, 'EV exemption'],
+      ['fbtNovated', fbtNovated, 'novated lease arrangements'],
+      ['fbtRemote', fbtRemote, 'remote area benefits'],
+      ['fbtEntertainment', fbtEntertainment, 'entertainment / minor benefits'],
+      ['fbtParking', fbtParking, 'car parking small-business'],
+      ['fbtChildcareWP', fbtChildcareWP, 'work-provided childcare'],
+      ['fbtLaptops', fbtLaptops, 'portable devices (s.58X)'],
+      ['fbtLAFHA', fbtLAFHA, 'LAFHA'],
+      ['fbtRelocation', fbtRelocation, 'relocation benefits'],
+      ['fbtPBI', fbtPBI, 'PBI/charity cap'],
+      ['fbtReligious', fbtReligious, 'religious institutions'],
+    ].forEach(([, on, label]) => {
+      if (!on) add('10. FBT', `${label}: REMOVED`);
+    });
+
+    // ── 11. New Taxes ───────────────────────────────────────────────────
+    if (lvt !== 0)        add('11. New Taxes', `Land value tax: ${lvt.toFixed(2)}%/yr`);
+    if (carbon !== 0)     add('11. New Taxes', `Carbon price: $${carbon}/t CO₂e`);
+    if (estate !== 0)     add('11. New Taxes', `Estate / inheritance tax: ${estate}%`);
+    if (wealth !== 0)     add('11. New Taxes', `Wealth tax: ${wealth.toFixed(2)}%/yr`);
+    if (finTax !== 0)     add('11. New Taxes', `Financial transactions tax: ${finTax.toFixed(2)}%`);
+
+    // ── 12. Other Taxes ─────────────────────────────────────────────────
+    if (customs !== 0)    add('12. Other Taxes', `Customs duties: ${customs >= 0 ? '+' : ''}${customs}% vs baseline`);
+    if (luxCar !== 33)    add('12. Other Taxes', `Luxury car tax: ${luxCar}% (default 33%)`);
+    if (wineEq !== 29)    add('12. Other Taxes', `Wine equalisation tax: ${wineEq}% (default 29%)`);
+    if (wato !== 0)       add('12. Other Taxes', `Working Australian Tax Offset: $${wato}/yr (default $0; Budget measure)`);
+
+    // ── 13. Trust Taxation ──────────────────────────────────────────────
+    if (trustMinTaxRate !== 0) add('13. Trust Taxation', `Discretionary trust minimum tax: ${trustMinTaxRate}% floor`);
+    if (trustBucketCo)    add('13. Trust Taxation', 'Bucket company distribution restrictions: ON');
+    if (trustS99B)        add('13. Trust Taxation', 'ITAA 1936 s.99B foreign trust tightening: ON');
+    if (trustLossRecoup)  add('13. Trust Taxation', 'Trust loss recoupment tightening: ON');
+    if (trustFTE)         add('13. Trust Taxation', 'Family Trust Election restrictions: ON');
+    if (trustStreaming)   add('13. Trust Taxation', 'Capital gain / franked dividend streaming tightening: ON');
+    if (trustCgtDisc)     add('13. Trust Taxation', 'Trust CGT discount removed: ON');
+
+    // ── 14. Environmental & Health Excises ──────────────────────────────
+    if (plasticExcise > 0)   add('14. Environmental & Health Excises', `Plastic packaging: $${plasticExcise.toFixed(2)}/kg`);
+    if (sugarLevy > 0)       add('14. Environmental & Health Excises', `Sugar-sweetened beverages: ${sugarLevy}%`);
+    if (singleUsePlastic > 0)add('14. Environmental & Health Excises', `Single-use plastic items: $${singleUsePlastic.toFixed(2)}/item`);
+    if (eWasteLevy > 0)      add('14. Environmental & Health Excises', `E-waste levy: $${eWasteLevy}/device`);
+    if (tyreLevy > 0)        add('14. Environmental & Health Excises', `Tyre levy: $${tyreLevy.toFixed(1)}/tyre`);
+    if (gamblingLevy > 0)    add('14. Environmental & Health Excises', `Online gambling levy: ${gamblingLevy}%`);
+    if (vapesExcise > 0)     add('14. Environmental & Health Excises', `Vapes excise: $${vapesExcise.toFixed(2)}/mL`);
+    if (alcoholHealth > 0)   add('14. Environmental & Health Excises', `Alcohol public health levy: +${alcoholHealth}%`);
+    if (airEmissions > 0)    add('14. Environmental & Health Excises', `Air travel emissions: $${airEmissions}/t CO₂e`);
+    if (batteryLevy > 0)     add('14. Environmental & Health Excises', `Battery recycling levy: $${batteryLevy.toFixed(1)}/kWh`);
+
+    // ── 15. Digital & Monopoly ──────────────────────────────────────────
+    if (digitalSvc > 0)      add('15. Digital & Monopoly', `Digital services levy: ${digitalSvc.toFixed(1)}%`);
+    if (monopolyLevy > 0)    add('15. Digital & Monopoly', `Monopoly profits levy: ${monopolyLevy}%`);
+
+    // ── 16. Nationalisation ─────────────────────────────────────────────
+    if (natLNG > 0)       add('16. Nationalisation', `LNG industry: ${natLNG}% Cth ownership`);
+    if (natIronOre > 0)   add('16. Nationalisation', `Iron ore (Pilbara): ${natIronOre}% Cth ownership`);
+    if (natCoalGen > 0)   add('16. Nationalisation', `Coal-fired generation: ${natCoalGen}% Cth ownership`);
+    if (natBanking > 0)   add('16. Nationalisation', `Big 4 banking: ${natBanking}% Cth ownership`);
+
+    // ── 17. Tax Expenditures, Withholding & Credits ─────────────────────
+    if (ftcRate !== 100)  add('17. Tax Expenditures', `Fuel Tax Credit rate: ${ftcRate}% of excise (default 100%)`);
+    if (!ftcMining)       add('17. Tax Expenditures', 'FTC mining eligibility: REMOVED');
+    if (!ftcAg)           add('17. Tax Expenditures', 'FTC agriculture eligibility: REMOVED');
+    if (mlsThreshold !== 93000) add('17. Tax Expenditures', `MLS threshold: $${mlsThreshold.toLocaleString()} (default $93,000)`);
+    if (mlsRate !== 1.0)  add('17. Tax Expenditures', `MLS rate: ${mlsRate.toFixed(1)}% (default 1.0%)`);
+    if (withholdDiv !== 30) add('17. Tax Expenditures', `Dividend WHT: ${withholdDiv}% (default 30%)`);
+    if (withholdInt !== 10) add('17. Tax Expenditures', `Interest WHT: ${withholdInt}% (default 10%)`);
+    if (withholdRoy !== 30) add('17. Tax Expenditures', `Royalty WHT: ${withholdRoy}% (default 30%)`);
+    if (div293Thresh !== 250) add('17. Tax Expenditures', `Div 293 threshold: $${div293Thresh}k (default $250k)`);
+    if (paygInstalment !== 0) add('17. Tax Expenditures', `PAYG instalment variation: +${paygInstalment}%`);
+    if (rdIncentive !== 43.5) add('17. Tax Expenditures', `R&D incentive (refundable): ${rdIncentive.toFixed(1)}% (default 43.5%)`);
+    if (thinCap)          add('17. Tax Expenditures', 'Thin capitalisation further tightening: ON');
+
+    // ── SPENDING SECTIONS ───────────────────────────────────────────────
+
+    // S1. Age Pension
+    if (pensRate !== 1150) add('S1. Age Pension', `Single fortnightly rate: $${pensRate}/fn (default $1,150)`);
+    if (pensAge !== 67)    add('S1. Age Pension', `Eligibility age: ${pensAge} (default 67)`);
+    if (pensAsset !== 700) add('S1. Age Pension', `Assets test cutout: $${pensAsset}k (default $700k)`);
+
+    // S2. Welfare
+    if (jsRate !== 810)    add('S2. Welfare, Family & Childcare', `JobSeeker: $${jsRate}/fn (default $810)`);
+    if (jsCutout !== 1390) add('S2. Welfare, Family & Childcare', `JobSeeker income cutout: $${jsCutout}/fn (default $1,390)`);
+    if (dspRate !== 1150)  add('S2. Welfare, Family & Childcare', `DSP: $${dspRate}/fn (default $1,150)`);
+    if (dspPts !== 20)     add('S2. Welfare, Family & Childcare', `DSP impairment points threshold: ${dspPts} (default 20)`);
+    if (ftbA !== 195)      add('S2. Welfare, Family & Childcare', `FTB-A: $${ftbA}/fn (default $195)`);
+    if (ftbB !== 170)      add('S2. Welfare, Family & Childcare', `FTB-B: $${ftbB}/fn (default $170)`);
+    if (childcare !== 58)  add('S2. Welfare, Family & Childcare', `Childcare subsidy: $${childcare}/day (default $58)`);
+    if (youthAllow !== 640) add('S2. Welfare, Family & Childcare', `Youth Allowance: $${youthAllow}/fn (default $640)`);
+    if (austudy !== 700)   add('S2. Welfare, Family & Childcare', `Austudy/ABSTUDY: $${austudy}/fn (default $700)`);
+
+    // S3. Health
+    if (gpBulk !== 91)     add('S3. Health & Medicare', `GP bulk-billing rate: ${gpBulk}% (default 91%)`);
+    if (gpRebate !== 44)   add('S3. Health & Medicare', `GP rebate: $${gpRebate} (default $44)`);
+    if (hospital !== 37.4) add('S3. Health & Medicare', `Hospital funding: $${hospital.toFixed(1)}B/yr (default $37.4B)`);
+    if (pbs !== 31.60)     add('S3. Health & Medicare', `PBS co-payment: $${pbs.toFixed(2)} (default $31.60)`);
+    if (acdc !== 0.2)      add('S3. Health & Medicare', `ACDC funding: $${acdc.toFixed(1)}B/yr (default $0.2B)`);
+    if (dentalVision > 0)  add('S3. Health & Medicare', `Universal dental & vision: $${dentalVision.toFixed(1)}B/yr (default $0)`);
+    if (mentalHealth !== 7.4) add('S3. Health & Medicare', `Mental health: $${mentalHealth.toFixed(1)}B/yr (default $7.4B)`);
+    if (indigHealth !== 4.3) add('S3. Health & Medicare', `Indigenous health: $${indigHealth.toFixed(1)}B/yr (default $4.3B)`);
+    if (phiReform)         add('S3. Health & Medicare', 'PHI reform (remove age-based rebate uplift): ON (Budget measure)');
+
+    // S4. NDIS
+    if (ndisP !== 720)     add('S4. NDIS', `Participants: ${ndisP}k (default 720k)`);
+    if (ndisCost !== 78)   add('S4. NDIS', `Average cost/person: $${ndisCost}k (default $78k)`);
+    if (thrivingKids > 0)  add('S4. NDIS', `Thriving Kids: $${thrivingKids.toFixed(1)}B/yr (Budget measure)`);
+    if (foundSupports !== 0.28) add('S4. NDIS', `Foundational Supports: $${foundSupports.toFixed(2)}B/yr (default $0.28B)`);
+
+    // S5. Aged Care
+    if (inHome !== 22000)  add('S5. Aged Care', `In-home care package avg: $${(inHome/1000).toFixed(0)}k (default $22k)`);
+    if (resCare !== 70)    add('S5. Aged Care', `Govt share of residential care: ${resCare}% (default 70%)`);
+
+    // S6. Education
+    if (eduPerStu !== 7800) add('S6. Education', `Per-student funding: $${eduPerStu.toLocaleString()}/yr (default $7,800)`);
+    if (earlyChild !== 2.0) add('S6. Education', `Early childhood: $${earlyChild.toFixed(1)}B/yr (default $2.0B)`);
+    if (vetTafe !== 2.6)   add('S6. Education', `VET/TAFE: $${vetTafe.toFixed(1)}B/yr (default $2.6B)`);
+    if (uniRes !== 10.5)   add('S6. Education', `University research (general): $${uniRes.toFixed(1)}B/yr (default $10.5B)`);
+    if (csiroFund !== 1.0) add('S6. Education', `CSIRO: $${csiroFund.toFixed(2)}B/yr (default $1.0B)`);
+    if (nhmrcFund !== 1.2) add('S6. Education', `NHMRC: $${nhmrcFund.toFixed(2)}B/yr (default $1.2B)`);
+    if (arcFund !== 0.8)   add('S6. Education', `ARC: $${arcFund.toFixed(2)}B/yr (default $0.8B)`);
+    if (uniSub !== 45)     add('S6. Education', `Uni fee subsidy: ${uniSub}% (default 45%)`);
+    if (regHigherEd > 0)   add('S6. Education', `Regional/equity loading: $${regHigherEd.toFixed(1)}B/yr`);
+
+    // S7. Defence
+    if (defence !== 2.02)  add('S7. Defence', `Spending: ${defence.toFixed(2)}% GDP (default 2.02%)`);
+
+    // S8. Infrastructure
+    if (roadRail !== 15.3) add('S8. Infrastructure', `Road & rail: $${roadRail.toFixed(1)}B/yr (default $15.3B)`);
+    if (otherInfra !== 8)  add('S8. Infrastructure', `Other infrastructure: $${otherInfra.toFixed(1)}B/yr (default $8B)`);
+    if (localInfraFund !== 0.26) add('S8. Infrastructure', `Local Infrastructure Fund: $${localInfraFund.toFixed(2)}B/yr (default $0.26B; Budget measure)`);
+
+    // S9. APS
+    if (aps !== 217)       add('S9. APS', `Headcount: ${aps}k ASL (default 217k)`);
+    if (apsWage !== 0)     add('S9. APS', `Real wage increase vs CPI: +${apsWage}%`);
+
+    // S10. Climate
+    if (capInv !== 8)      add('S10. Climate', `Capacity Investment Scheme: $${capInv.toFixed(1)}B/yr (default $8B)`);
+    if (envProg !== 7)     add('S10. Climate', `Other environment programs: $${envProg.toFixed(1)}B/yr (default $7B)`);
+
+    // S11. Other Spending
+    if (vets !== 12.2)     add('S11. Other Spending', `Veterans Affairs: $${vets.toFixed(1)}B/yr (default $12.2B)`);
+    if (aid !== 5.1)       add('S11. Other Spending', `Foreign aid (ODA): $${aid.toFixed(1)}B/yr (default $5.1B)`);
+    if (housingP !== 11.4) add('S11. Other Spending', `Housing & homelessness: $${housingP.toFixed(1)}B/yr (default $11.4B)`);
+    if (helpToBuyExt !== 1.6) add('S11. Other Spending', `Help to Buy: $${helpToBuyExt.toFixed(1)}B/yr (default $1.6B; Budget measure)`);
+    if (indig !== 6)       add('S11. Other Spending', `Indigenous programs: $${indig.toFixed(1)}B/yr (default $6B)`);
+    if (agri !== 5)        add('S11. Other Spending', `Agriculture/water/rural: $${agri.toFixed(1)}B/yr (default $5B)`);
+    if (immig !== 5)       add('S11. Other Spending', `Immigration (admin): $${immig.toFixed(1)}B/yr (default $5B)`);
+    if (borderForce !== 2.8) add('S11. Other Spending', `Border Force: $${borderForce.toFixed(1)}B/yr (default $2.8B)`);
+    if (afp !== 2.4)       add('S11. Other Spending', `AFP: $${afp.toFixed(1)}B/yr (default $2.4B)`);
+    if (arts !== 2)        add('S11. Other Spending', `Arts, sport & culture: $${arts.toFixed(1)}B/yr (default $2B)`);
+
+    // S12. Higher Education Reform
+    if (helpIndexation !== 4.0) add('S12. Higher Education', `HELP indexation: ${helpIndexation.toFixed(1)}%/yr (default 4%)`);
+
+    // S13. State & Territory commitments
+    const stateLevers = [
+      ['saWhyalla', saWhyalla, 0.121, 'SA Whyalla'],
+      ['saHMRB', saHMRB, 0.012, 'SA HMRB loans'],
+      ['saNorthernWater', saNorthernWater, 0.060, 'SA Northern Water'],
+      ['nswWSALink', nswWSALink, 0.350, 'NSW WSA rail'],
+      ['nswHumeLink', nswHumeLink, 0.240, 'NSW HumeLink'],
+      ['nswM12', nswM12, 0.080, 'NSW M12'],
+      ['vicSRL', vicSRL, 2.200, 'VIC SRL East'],
+      ['vicGeelongRail', vicGeelongRail, 0.180, 'VIC Geelong Rail'],
+      ['vicYarraRecovery', vicYarraRecovery, 0.040, 'VIC Yarra recovery'],
+      ['qldBruceHwy', qldBruceHwy, 0.700, 'QLD Bruce Hwy'],
+      ['qldOlympics', qldOlympics, 0.300, 'QLD 2032 Olympics'],
+      ['qldCopperString', qldCopperString, 0.110, 'QLD CopperString'],
+      ['waWestport', waWestport, 0.080, 'WA Westport'],
+      ['waMetronet', waMetronet, 0.260, 'WA METRONET'],
+      ['waPilbaraEnergy', waPilbaraEnergy, 0.080, 'WA Pilbara energy'],
+      ['tasMacqPoint', tasMacqPoint, 0.240, 'TAS Macquarie Pt'],
+      ['tasBridge', tasBridge, 0.300, 'TAS bridge replacement'],
+      ['tasFreightEq', tasFreightEq, 0.165, 'TAS freight equalisation'],
+      ['ntMiddleArm', ntMiddleArm, 0.300, 'NT Middle Arm'],
+      ['ntDefenceDual', ntDefenceDual, 0.220, 'NT Defence dual-use'],
+      ['actLightRail', actLightRail, 0.044, 'ACT Light Rail 2A'],
+      ['actNatInst', actNatInst, 0.180, 'ACT National institutions'],
+    ];
+    stateLevers.forEach(([, val, def, label]) => {
+      if (Math.abs(val - def) > 0.0001) {
+        add('S13. State & Territory commitments',
+          `${label}: $${(val*1000).toFixed(0)}M/yr (default $${(def*1000).toFixed(0)}M)`);
+      }
+    });
+
+    // S14. Commonwealth Government Enterprises
+    if (gbeAusPost > 0)     add('S14. Commonwealth GBEs', `Australia Post: +$${gbeAusPost}M/yr dividend uplift`);
+    if (gbeNBN > 0)         add('S14. Commonwealth GBEs', `NBN Co: +$${gbeNBN}M/yr (efficiency/partial sale)`);
+    if (gbeSnowyHydro > 0)  add('S14. Commonwealth GBEs', `Snowy Hydro: +$${gbeSnowyHydro}M/yr dividend uplift`);
+    if (gbeDefHousing > 0)  add('S14. Commonwealth GBEs', `Defence Housing Australia: +$${gbeDefHousing}M/yr`);
+    if (gbeAnsto > 0)       add('S14. Commonwealth GBEs', `ANSTO commercial: +$${gbeAnsto}M/yr`);
+    if (gbeAirservices > 0) add('S14. Commonwealth GBEs', `Airservices Australia: +$${gbeAirservices}M/yr`);
+    if (gbeMint > 0)        add('S14. Commonwealth GBEs', `Royal Australian Mint: +$${gbeMint}M/yr`);
+    if (gbeAusTrade > 0)    add('S14. Commonwealth GBEs', `Austrade commercial: +$${gbeAusTrade}M/yr`);
+    if (gbeAssetSales > 0)  add('S14. Commonwealth GBEs', `Asset recycling proceeds: $${gbeAssetSales.toFixed(1)}B one-off`);
+    if (reAcqTelstra > 0)   add('S14. Commonwealth GBEs', `Re-acquire Telstra: ${reAcqTelstra}% Cth stake`);
+    if (reAcqAirports > 0)  add('S14. Commonwealth GBEs', `Re-acquire major airports: ${reAcqAirports}% Cth stake`);
+    if (reAcqPorts > 0)     add('S14. Commonwealth GBEs', `Re-acquire major ports: ${reAcqPorts}% Cth stake`);
+    if (reAcqCommsBank > 0) add('S14. Commonwealth GBEs', `Re-acquire CBA: ${reAcqCommsBank}% Cth stake`);
+    if (gbeNewCorp)         add('S14. Commonwealth GBEs', `Generic strategic investment corp: $${gbeNewCorpSize}B cap, ${gbeNewCorpYield.toFixed(1)}% target return`);
+    if (gbeHousingCorp)     add('S14. Commonwealth GBEs', `Commonwealth Housing Finance Corp (CHFC): established, $${gbeHousingCapB}B capitalisation`);
+    if (gbeMfgCorp)         add('S14. Commonwealth GBEs', `Australian Strategic Manufacturing Corp (ASMC): established, $${gbeMfgCapB}B capitalisation`);
+    if (gbeCritMin)         add('S14. Commonwealth GBEs', `Australian Critical Minerals Investment Corp (ACMIC): established, $${gbeCritMinCapB}B capitalisation`);
+    if (gbeRegBank)         add('S14. Commonwealth GBEs', `Commonwealth Development Bank (CDB): established, $${gbeRegBankCapB}B capitalisation`);
+    if (gbeRewiringCorp)    add('S14. Commonwealth GBEs', `Rewiring Australia Corporation (RAC): established, $${gbeRewiringCapB}B capitalisation`);
+    if (gbeFirstNations)    add('S14. Commonwealth GBEs', `First Nations Wealth Fund (FNWF): established, $${gbeFirstNatCapB}B capitalisation`);
+
+    // S15. Commonwealth Investment Funds
+    const fundLines = [
+      ['Future Fund', ffContrib, ffTargetReturn, 4.5, ffSalePct, ffDissolve, ffEarlyDraw],
+      ['MRFF', mrffContrib, null, null, mrffSalePct, mrffDissolve, null, mrffDisburseAdj],
+      ['DCAF', dcafContrib, null, null, dcafSalePct, dcafDissolve, null, dcafDisburseAdj],
+      ['ATSILSFF', atsilsffContrib, null, null, atsilsffSalePct, atsilsffDissolve, null, atsilsffDisburseAdj],
+      ['Future Drought Fund', fdfContrib, null, null, fdfSalePct, fdfDissolve, null, fdfDisburseAdj],
+      ['Disaster Ready Fund', drfContrib, null, null, drfSalePct, drfDissolve, null, drfDisburseAdj],
+      ['HAFF', haffContrib, null, null, haffSalePct, haffDissolve, null, haffDisburseAdj],
+      ['CEFC', cefcContrib, cefcTargetReturn, 4.5, cefcSalePct, cefcDissolve, null],
+      ['NRFC', nrfcContrib, nrfcTargetReturn, 5.5, nrfcSalePct, nrfcDissolve, null],
+    ];
+    fundLines.forEach(([name, contrib, target, targetDef, sale, dissolve, draw, disb]) => {
+      if (contrib > 0) add('S15. Commonwealth Investment Funds', `${name}: +$${contrib}B contribution`);
+      if (target !== null && target !== undefined && target !== targetDef) {
+        add('S15. Commonwealth Investment Funds', `${name}: target return ${target.toFixed(2)}% (default ${targetDef}%)`);
+      }
+      if (disb !== null && disb !== undefined && Math.abs(disb) > 0.001) {
+        add('S15. Commonwealth Investment Funds', `${name}: disbursement ${disb >= 0 ? '+' : ''}$${disb.toFixed(2)}B/yr`);
+      }
+      if (draw !== null && draw !== undefined && draw > 0) {
+        add('S15. Commonwealth Investment Funds', `${name}: early drawdown $${draw}B/yr`);
+      }
+      if (sale > 0) add('S15. Commonwealth Investment Funds', `${name}: ${sale}% partial sale`);
+      if (dissolve) add('S15. Commonwealth Investment Funds', `${name}: FULL DISSOLUTION (requires repeal of enabling Act)`);
+    });
+    if (newSoverFund)   add('S15. Commonwealth Investment Funds', `Sovereign Wealth Fund (Norwegian model): established, $${newSoverFundCapB}B + $${newSoverFundContribAnnual}B/yr from resource rents`);
+    if (newGenFund)     add('S15. Commonwealth Investment Funds', `Future Generations Fund: established, $${newGenFundCapB}B capitalisation`);
+    if (newInfraFund)   add('S15. Commonwealth Investment Funds', `National Infrastructure Investment Fund: established, $${newInfraFundCapB}B capitalisation`);
+    if (newDefenceFund) add('S15. Commonwealth Investment Funds', `Defence Industry Investment Fund (post-AUKUS): established, $${newDefenceFundCapB}B capitalisation`);
+
+    // ── Build output text ───────────────────────────────────────────────
+    const dateStr = new Date().toISOString().split('T')[0];
+    const lines = [];
+    lines.push('AUSTRALIAN FEDERAL BUDGET SIMULATOR — CHANGED INPUTS');
+    lines.push(`Baseline: 2026-27 Commonwealth Budget  ·  Generated: ${dateStr}`);
+    lines.push('═══════════════════════════════════════════════════════════');
+
+    const sectionKeys = Object.keys(sections);
+    if (sectionKeys.length === 0) {
+      lines.push('');
+      lines.push('No changes from baseline.');
+    } else {
+      for (const sec of sectionKeys) {
+        lines.push('');
+        lines.push(sec);
+        lines.push('─'.repeat(Math.min(sec.length + 4, 60)));
+        for (const itemLine of sections[sec]) {
+          lines.push(`  · ${itemLine}`);
+        }
+      }
+    }
+
+    // Net fiscal effect footer
+    const bal = BASELINE_DEFICIT + revChange - spendChange;
+    lines.push('');
+    lines.push('═══════════════════════════════════════════════════════════');
+    lines.push('NET FISCAL EFFECT');
+    lines.push('─────────────────');
+    const sgn = v => v >= 0 ? '+' : '−';
+    lines.push(`  Revenue change:    ${sgn(revChange)}$${Math.abs(revChange).toFixed(1)}B/yr`);
+    lines.push(`  Spending change:   ${sgn(spendChange)}$${Math.abs(spendChange).toFixed(1)}B/yr`);
+    lines.push(`  Net improvement:   ${sgn(revChange - spendChange)}$${Math.abs(revChange - spendChange).toFixed(1)}B/yr`);
+    lines.push(`  Final balance:     ${sgn(bal)}$${Math.abs(bal).toFixed(1)}B (${(bal/GDP*100).toFixed(2)}% GDP) — ${bal >= 0 ? 'SURPLUS' : 'DEFICIT'}`);
+    lines.push('');
+    lines.push('Note: figures are first-year (2026-27) static estimates.');
+    lines.push('Multi-year compounding shown in the Forward Estimates panel.');
+
+    // ── Embedded re-import block ────────────────────────────────────────
+    // Machine-readable JSON wrapped in version-tagged delimiters. The Import
+    // path detects these markers and extracts just the JSON, allowing the
+    // pasted/uploaded text file to round-trip back into a full scenario.
+    const scenario = { ...buildScenario(), exportedAt: new Date().toISOString() };
+    lines.push('');
+    lines.push('═══════════════════════════════════════════════════════════');
+    lines.push('RE-IMPORT DATA — required to restore via paste or upload');
+    lines.push('Do not edit below this line. To re-apply this scenario:');
+    lines.push('  1. Save this entire text as a .txt file, OR copy all of it');
+    lines.push('  2. Use the Import button (accepts .txt) or Paste Inputs');
+    lines.push('═══════════════════════════════════════════════════════════');
+    lines.push('<<<BUDGET_SIM_v1');
+    lines.push(JSON.stringify(scenario));
+    lines.push('BUDGET_SIM_v1>>>');
+
+    const text = lines.join('\n');
+
+    // ── Copy to clipboard with fallback ─────────────────────────────────
+    const showResult = (success) => {
+      setCopyFeedback(success ? '✓ Copied!' : '✗ Copy failed');
+      setTimeout(() => setCopyFeedback(''), 2200);
+    };
+
+    if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        () => showResult(true),
+        () => {
+          // Fall through to legacy execCommand path
+          legacyCopy(text, showResult);
+        }
+      );
+    } else {
+      legacyCopy(text, showResult);
+    }
+  };
+
+  // Legacy clipboard fallback for sandboxed iframe contexts where
+  // navigator.clipboard.writeText may be blocked or unavailable.
+  const legacyCopy = (text, showResult) => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      showResult(ok);
+    } catch {
+      showResult(false);
+    }
+  };
+
+  // ── Paste Inputs handler ────────────────────────────────────────────────────
+  // Accepts either a Copy Inputs text dump (with embedded <<<BUDGET_SIM_v1>>>
+  // block) or raw scenario JSON. Routes through importSettings to reuse the
+  // existing setter chain — the synthetic-event pattern mirrors the autosave
+  // restore path at app mount.
+  const handlePasteApply = () => {
+    const text = pasteText.trim();
+    if (!text) {
+      setPasteFeedback('Nothing to apply');
+      setTimeout(() => setPasteFeedback(''), 2200);
+      return;
+    }
+    // Quick sanity check: must contain either the delimiter block or a JSON object
+    const hasBlock = /<<<BUDGET_SIM_v1[\s\S]*?BUDGET_SIM_v1>>>/.test(text);
+    const looksLikeJson = text.trim().startsWith('{');
+    if (!hasBlock && !looksLikeJson) {
+      setPasteFeedback('✗ No re-import data found');
+      setTimeout(() => setPasteFeedback(''), 3000);
+      return;
+    }
+    try {
+      importSettings({
+        target: { files: [new Blob([text], { type: "text/plain" })], value: "" }
+      });
+      setPasteFeedback('✓ Applied');
+      setPasteText('');
+      setTimeout(() => {
+        setPasteFeedback('');
+        setPasteOpen(false);
+      }, 1500);
+    } catch (err) {
+      setPasteFeedback('✗ ' + (err.message || 'Apply failed'));
+      setTimeout(() => setPasteFeedback(''), 3000);
+    }
+  };
+
+  // ── Reset all state to baseline defaults ────────────────────────────────────
+  // Single source of truth for "factory reset" — used by the Reset All button
+  // and as the starting point for every preset (so presets only need to
+  // specify their *overrides* rather than every setting).
+  const resetAllDefaults = () => {
+    setBrackets(DEFAULT_BRACKETS); setNextId(10);
+    setMedicare(2);
+    setCompanyBrackets(DEFAULT_COMPANY_BRACKETS); setNextCompanyId(7);
+    setGstRate(10); setGstBase(false); setGstRetain(0);
+    setGstExFood(false); setGstExHealth(false); setGstExEducation(false);
+    setGstExChildcare(false); setGstExReligious(false); setGstExCharity(false);
+    setGstExRentRes(false); setGstExFinancial(false);
+    setGstExWaterSewer(false); setGstExPrecMetals(false);
+    setSuperEarn(15); setSuperConc(15); setSuperHB(30); setCgtDisc(50); setPrimRes(0);
+    setNegGear(0); setFuel(50.8); setEvRUC(0); setTobacco(1.75); setAlcohol(0.70);
+    setPrrt(40); setMinLevy(0); setLngLevy(0); setFbtRate(47); setFbtExempt(0);
+    setLvt(0); setCarbon(0); setEstate(0); setWealth(0); setFinTax(0);
+    setCustoms(0); setLuxCar(33); setWineEq(29);
+    setPensRate(1150); setPensAge(67); setPensAsset(700); setJsRate(810); setJsCutout(1390);
+    setDspRate(1150); setDspPts(20); setFtbA(195); setFtbB(170); setChildcare(58);
+    setGpBulk(91); setGpRebate(44); setHospital(37.4); setPbs(31.60); setAcdc(0.2);
+    setNdisP(720); setNdisCost(78); setInHome(22000); setResCare(70);
+    setEduPerStu(7800); setUniRes(10.5); setUniSub(45); setRegHigherEd(0);
+    setDefence(2.02); setRoadRail(15.3); setOtherInfra(8);
+    setAps(217); setApsWage(0); setCapInv(8); setEnvProg(7);
+    setVets(12.2); setAid(5.1); setHousingP(11.4); setIndig(6); setAgri(5);
+    setImmig(5); setArts(2);
+    setWato(0); setNegGearNew(false); setCgtMinTax(false);
+    setPhiReform(false); setLossCarry(false); setIawo(true); setPmc(70); setGasReserve(0);
+    setThrivingKids(0); setFoundSupports(0.28); setLocalInfraFund(0.26);
+    setHelpToBuyExt(1.6); setHelpIndexation(4.0);
+    setSaWhyalla(0.121); setSaHMRB(0.012); setSaNorthernWater(0.060);
+    setNswWSALink(0.350); setNswHumeLink(0.240); setNswM12(0.080);
+    setVicSRL(2.200); setVicGeelongRail(0.180); setVicYarraRecovery(0.040);
+    setQldBruceHwy(0.700); setQldOlympics(0.300); setQldCopperString(0.110);
+    setWaWestport(0.080); setWaMetronet(0.260); setWaPilbaraEnergy(0.080);
+    setTasMacqPoint(0.240); setTasBridge(0.300); setTasFreightEq(0.165);
+    setNtMiddleArm(0.300); setNtDefenceDual(0.220);
+    setActLightRail(0.044); setActNatInst(0.180);
+    setPlasticExcise(0); setSugarLevy(0); setDigitalSvc(0); setMonopolyLevy(0);
+    setHvRUC(20.6); setHvEvDiscount(100); setEvSurcharge(0);
+    setFbtEV(true); setFbtNovated(true); setFbtRemote(true);
+    setFbtEntertainment(true); setFbtParking(true); setFbtChildcareWP(true); setFbtLaptops(true);
+    setFbtLAFHA(true); setFbtRelocation(true); setFbtPBI(true); setFbtReligious(true);
+    setTrustMinTaxRate(0); setTrustBucketCo(false); setTrustS99B(false);
+    setTrustLossRecoup(false); setTrustFTE(false); setTrustStreaming(false); setTrustCgtDisc(false);
+    setSingleUsePlastic(0); setEWasteLevy(0); setTyreLevy(0); setGamblingLevy(0);
+    setVapesExcise(0); setAlcoholHealth(0); setAirEmissions(0); setBatteryLevy(0);
+    setNatLNG(0); setNatIronOre(0); setNatCoalGen(0); setNatBanking(0);
+    setFtcRate(100); setFtcMining(true); setFtcAg(true);
+    setMlsThreshold(93000); setMlsRate(1.0);
+    setWithholdDiv(30); setWithholdInt(10); setWithholdRoy(30);
+    setDiv293Thresh(250); setPaygInstalment(0);
+    setRdIncentive(43.5); setThinCap(false); setLitoMax(700);
+    setGbeAusPost(0); setGbeNBN(0); setGbeSnowyHydro(0); setGbeAssetSales(0);
+    setGbeNewCorp(false); setGbeNewCorpSize(5); setGbeNewCorpYield(6);
+    setGbeDefHousing(0); setGbeAnsto(0); setGbeAirservices(0); setGbeMint(0); setGbeAusTrade(0);
+    setReAcqTelstra(0); setReAcqAirports(0); setReAcqPorts(0); setReAcqCommsBank(0);
+    setGbeHousingCorp(false); setGbeHousingCapB(10);
+    setGbeMfgCorp(false); setGbeMfgCapB(10);
+    setGbeCritMin(false); setGbeCritMinCapB(5);
+    setGbeRegBank(false); setGbeRegBankCapB(8);
+    setGbeRewiringCorp(false); setGbeRewiringCapB(8);
+    setGbeFirstNations(false); setGbeFirstNatCapB(6);
+    setYouthAllow(640); setAustudy(700);
+    setDentalVision(0); setMentalHealth(7.4); setIndigHealth(4.3);
+    setCsiroFund(1.0); setNhmrcFund(1.2); setArcFund(0.8);
+    setVetTafe(2.6); setAfp(2.4); setBorderForce(2.8); setEarlyChild(2.0);
+    // Commonwealth Investment Funds (Phase 13)
+    setFfContrib(0); setFfTargetReturn(4.5); setFfSalePct(0); setFfDissolve(false); setFfEarlyDraw(0);
+    setMrffContrib(0); setMrffDisburseAdj(0); setMrffSalePct(0); setMrffDissolve(false);
+    setDcafContrib(0); setDcafDisburseAdj(0); setDcafSalePct(0); setDcafDissolve(false);
+    setAtsilsffContrib(0); setAtsilsffDisburseAdj(0); setAtsilsffSalePct(0); setAtsilsffDissolve(false);
+    setFdfContrib(0); setFdfDisburseAdj(0); setFdfSalePct(0); setFdfDissolve(false);
+    setDrfContrib(0); setDrfDisburseAdj(0); setDrfSalePct(0); setDrfDissolve(false);
+    setHaffContrib(0); setHaffDisburseAdj(0); setHaffSalePct(0); setHaffDissolve(false);
+    setCefcContrib(0); setCefcTargetReturn(4.5); setCefcSalePct(0); setCefcDissolve(false);
+    setNrfcContrib(0); setNrfcTargetReturn(5.5); setNrfcSalePct(0); setNrfcDissolve(false);
+    setNewSoverFund(false); setNewSoverFundCapB(20); setNewSoverFundContribAnnual(5);
+    setNewGenFund(false); setNewGenFundCapB(15);
+    setNewInfraFund(false); setNewInfraFundCapB(25);
+    setNewDefenceFund(false); setNewDefenceFundCapB(10);
+  };
+
+  // ── Preset library ──────────────────────────────────────────────────────────
+  // Each preset's onClick handler calls resetAllDefaults() first, then layers
+  // the preset-specific overrides on top. This keeps each preset compact and
+  // ensures no stale state leaks between presets.
+
+  // 1. Fiscally Conservative — Coalition Treasury orthodoxy. Stage 4 preserved
+  //    with TBRL-style top bracket, 25% flat company rate (Howard-Costello-
+  //    Frydenberg target), expenditure restraint, modest defence uplift.
+  const applyPresetConservative = () => {
+    resetAllDefaults();
+    // Pure Stage 4 (the legislated current rates that Coalition supports
+    // maintaining). No TBRL — Coalition hasn't supported the Temporary Budget
+    // Repair Levy since it expired in 2017.
+    setBrackets([
+      { id: 1, min: 0,       max: 18200,    rate: 0  },
+      { id: 2, min: 18201,   max: 45000,    rate: 15 },
+      { id: 3, min: 45001,   max: 135000,   rate: 30 },
+      { id: 4, min: 135001,  max: 190000,   rate: 37 },
+      { id: 5, min: 190001,  max: Infinity, rate: 45 },
+    ]);
+    setNextId(7);
+    setCompanyBrackets([
+      { id: 1, min: 0,         max: 50000,     rate: 25 },
+      { id: 2, min: 50000,     max: 500000,    rate: 25 },
+      { id: 3, min: 500000,    max: 5000000,   rate: 25 },
+      { id: 4, min: 5000000,   max: 50000000,  rate: 25 },
+      { id: 5, min: 50000000,  max: 250000000, rate: 25 },
+      { id: 6, min: 250000000, max: Infinity,  rate: 25 },  // 25% flat (long-standing Coalition target)
+    ]);
+    setNextCompanyId(7);
+    // Small business friendly Phase 5 measures
+    setLossCarry(true); setIawo(true);
+    // Repeal Div 296 (Coalition voted against it; restore 15% on high balances)
+    setSuperHB(15);
+    // Modest excise indexation
+    setTobacco(1.85);
+    // Defence uplift to 2.5% (Dutton's stated 2030 target)
+    setDefence(2.5); setBorderForce(3.5); setAfp(2.6);
+    // Spending discipline
+    setAps(200);                     // 8% APS cut (Coalition pre-pandemic level)
+    setHelpIndexation(4.0);          // Market rate indexation
+    setNdisP(700); setNdisCost(74);  // Eligibility reform
+    setAid(4);                       // Modest foreign aid cut
+    setImmig(4);                     // Tighter immigration administration
+    // Climate spending halved
+    setCapInv(4); setEnvProg(5);
+    // EV transition managed (Coalition opposed EV subsidies but accepts RUC)
+    setEvRUC(2); setEvSurcharge(50);
+  };
+
+  // 2. Libertarian / Classical Liberal — LDP / Friedman / Hayek. Two-bracket
+  //    income tax with high tax-free threshold replacing welfare, 22% flat
+  //    company tax, comprehensive privatisation, GST broadened.
+  const applyPresetLibertarian = () => {
+    resetAllDefaults();
+    setBrackets([
+      { id: 1, min: 0,     max: 30000,    rate: 0  },   // High threshold = de facto basic income
+      { id: 2, min: 30001, max: Infinity, rate: 25 },   // Single flat rate
+    ]);
+    setNextId(4);
+    setLitoMax(0);                    // Threshold replaces LITO
+    setCompanyBrackets([
+      { id: 1, min: 0,         max: 50000,     rate: 22 },
+      { id: 2, min: 50000,     max: 500000,    rate: 22 },
+      { id: 3, min: 500000,    max: 5000000,   rate: 22 },
+      { id: 4, min: 5000000,   max: 50000000,  rate: 22 },
+      { id: 5, min: 50000000,  max: 250000000, rate: 22 },
+      { id: 6, min: 250000000, max: Infinity,  rate: 22 },
+    ]);
+    setNextCompanyId(7);
+    // Super: zero earnings tax
+    setSuperEarn(0); setSuperConc(15); setSuperHB(0);
+    // CGT: substantial discount (approaching no-CGT position; Friedman/Hayek
+    // opposed taxing capital gains as it discourages investment and saving)
+    setCgtDisc(75);
+    // Explicitly zero all wealth-based taxes (libertarians categorically reject
+    // taxing accumulated capital — these are set to 0 by resetAllDefaults but
+    // making explicit guards against future preset chaining)
+    setLvt(0); setEstate(0); setWealth(0); setFinTax(0);
+    // GST broadened to fund income tax cuts
+    setGstRate(12.5);
+    setGstExFood(true); setGstExHealth(true); setGstExEducation(true);
+    setGstExChildcare(true); setGstExFinancial(true);
+    // Tariffs: zero
+    setCustoms(-50);
+    // Asset recycling — comprehensive privatisation
+    setGbeAssetSales(60);
+    // Welfare cuts
+    setPensRate(1000); setPensAsset(500);
+    setJsRate(700); setJsCutout(1390);
+    setDspRate(1000); setChildcare(30);
+    setNdisP(400); setNdisCost(50);   // Severe NDIS restriction
+    setAid(1); setIndig(4); setArts(1);
+    setAps(150); setApsWage(0);       // 30% APS cut
+    setHelpIndexation(4.0);
+    // No universal services
+    setDentalVision(0); setMentalHealth(7.4);
+    setEarlyChild(2.0); setVetTafe(2.6); setUniSub(45);
+    // Defence: security spending preserved
+    setDefence(2.5); setBorderForce(3.5);
+    // No Phase 5 progressive measures except small business
+    setLossCarry(true); setIawo(true);
+    // FUND DISSOLUTION — libertarians categorically oppose sovereign investment
+    // funds (state-directed capital allocation distorts markets). Comprehensive
+    // wind-up generates massive one-off revenue but eliminates the
+    // intergenerational savings infrastructure.
+    setFfDissolve(true);           // Future Fund — wind up (returns $267B to CRF)
+    setCefcDissolve(true);         // CEFC — Coalition 2014 abolition completed
+    setNrfcDissolve(true);         // NRFC — Coalition 2023 voted against; abolish
+    setHaffDissolve(true);         // HAFF — return $11.5B to CRF
+    setFdfSalePct(100);            // Drought support via private insurance markets
+    setDrfSalePct(100);            // Disaster response via state/private
+    // MRFF, DCAF, ATSILSFF retained — these have specific statutory beneficiaries
+    // that would require alternative funding arrangements
+    setMrffSalePct(50);            // Partial — medical research has commercial co-investment
+  };
+
+  // 3. Maximalist Progressive — Curtin restoration plus Piketty-Saez and MMT.
+  //    Steepest income tax (75% top rate, WWII Curtin level), maximum wealth
+  //    and capital taxation, universal services free at point of use, full
+  //    nationalisation programme, deficit accepted on MMT grounds.
+  const applyPresetMaxProgressive = () => {
+    resetAllDefaults();
+    setBrackets([
+      { id: 1,  min: 0,       max: 24000,    rate: 0  },  // Henry-aligned; clean pool-model behaviour
+      { id: 2,  min: 24001,   max: 60000,    rate: 15 },
+      { id: 3,  min: 60001,   max: 100000,   rate: 25 },
+      { id: 4,  min: 100001,  max: 150000,   rate: 35 },
+      { id: 5,  min: 150001,  max: 250000,   rate: 45 },
+      { id: 6,  min: 250001,  max: 500000,   rate: 55 },
+      { id: 7,  min: 500001,  max: 1000000,  rate: 65 },
+      { id: 8,  min: 1000001, max: Infinity, rate: 75 },  // Curtin WWII top rate
+    ]);
+    setNextId(11);
+    setMedicare(2.5); setLitoMax(2500);
+    setCompanyBrackets([
+      { id: 1, min: 0,         max: 50000,     rate: 25 },
+      { id: 2, min: 50000,     max: 500000,    rate: 25 },
+      { id: 3, min: 500000,    max: 5000000,   rate: 30 },
+      { id: 4, min: 5000000,   max: 50000000,  rate: 40 },
+      { id: 5, min: 50000000,  max: 250000000, rate: 45 },
+      { id: 6, min: 250000000, max: Infinity,  rate: 50 },  // Top-100 entities
+    ]);
+    setNextCompanyId(7);
+    // Super: tiered for high earners
+    setSuperEarn(20); setSuperConc(30); setSuperHB(50);
+    // Full capital-labour equivalence
+    setCgtDisc(0); setPrimRes(50); setCgtMinTax(true);
+    setNegGear(100); setNegGearNew(true);
+    // Wealth taxes maximised (Piketty schedule)
+    setLvt(1.5); setEstate(40); setWealth(2.0); setFinTax(0.1);
+    // Resource taxes
+    setPrrt(80); setMinLevy(25); setLngLevy(5); setGasReserve(60);
+    // Carbon and environmental at maximum
+    setCarbon(200); setFuel(60); setEvRUC(0); setEvSurcharge(0);
+    setPlasticExcise(3); setSugarLevy(20); setSingleUsePlastic(0.75);
+    setEWasteLevy(20); setTyreLevy(3); setGamblingLevy(30); setVapesExcise(1);
+    setAlcoholHealth(10); setAirEmissions(80); setBatteryLevy(5);
+    setTobacco(2.5); setAlcohol(1.20);
+    // Digital and monopoly
+    setDigitalSvc(8); setMonopolyLevy(10);
+    // Trust tightening (all on)
+    setTrustMinTaxRate(40); setTrustBucketCo(true); setTrustS99B(true);
+    setTrustLossRecoup(true); setTrustFTE(true); setTrustStreaming(true); setTrustCgtDisc(true);
+    // Tax expenditures
+    setFtcRate(0); setFtcMining(false); setFtcAg(false);
+    setMlsThreshold(75000); setMlsRate(2.0);
+    setWithholdDiv(30); setWithholdInt(25); setWithholdRoy(45);
+    setDiv293Thresh(180); setRdIncentive(20); setThinCap(true);
+    setWato(0); setLuxCar(50); setWineEq(45);
+    // Nationalisation (full)
+    setNatLNG(100); setNatIronOre(50); setNatCoalGen(100); setNatBanking(30);
+    // GBE expansion (all corporations established)
+    setReAcqTelstra(100); setReAcqAirports(100); setReAcqPorts(100); setReAcqCommsBank(60);
+    setGbeAusPost(200); setGbeNBN(500); setGbeSnowyHydro(300);
+    setGbeDefHousing(150); setGbeAnsto(80); setGbeAirservices(200);
+    setGbeHousingCorp(true); setGbeHousingCapB(25);
+    setGbeMfgCorp(true); setGbeMfgCapB(20);
+    setGbeCritMin(true); setGbeCritMinCapB(15);
+    setGbeRegBank(true); setGbeRegBankCapB(15);
+    setGbeRewiringCorp(true); setGbeRewiringCapB(20);
+    setGbeFirstNations(true); setGbeFirstNatCapB(15);
+    // Universal services maximised
+    setPensRate(1300); setJsRate(1300); setDspRate(1300);
+    setFtbA(250); setFtbB(220); setChildcare(120);  // Free childcare
+    setYouthAllow(1100); setAustudy(1100);
+    setGpBulk(100); setGpRebate(60); setHospital(45); setPbs(20); setAcdc(2);
+    setDentalVision(18); setMentalHealth(15); setIndigHealth(7); setPhiReform(true);
+    setNdisP(750); setNdisCost(82);  // Preserved at quality
+    setInHome(45000); setResCare(100);
+    setEduPerStu(11500); setEarlyChild(4); setVetTafe(5);
+    setUniRes(20); setCsiroFund(3); setNhmrcFund(2.5); setArcFund(2);
+    setUniSub(100); setRegHigherEd(1); setHelpIndexation(0); setHelpToBuyExt(2);
+    setHousingP(35); setAid(10); setIndig(12); setArts(4);
+    setAps(280); setApsWage(3);  // Real wage leader
+    setCapInv(25); setEnvProg(15);
+    setDefence(1.8);  // Peace dividend
+    // Phase 5 progressive
+    setLossCarry(true); setIawo(true); setPhiReform(true);
+    setThrivingKids(1.0); setFoundSupports(0.6); setLocalInfraFund(1.5);
+    setPmc(150);
+    // FUND EXPANSION — universal services need permanent investment infrastructure.
+    // Disbursement uplifts directly fund the broader spending programme.
+    setFfContrib(20);              // Future Fund — capital injection from wealth tax revenue
+    setFfTargetReturn(5.0);        // Top of mandate range
+    setMrffContrib(10); setMrffDisburseAdj(1.5); // MRFF expansion: $1.5B/yr to medical research
+    setDcafContrib(15); setDcafDisburseAdj(5);   // DCAF expansion: $5B/yr to NDIS preservation
+    setHaffContrib(25); setHaffDisburseAdj(3);   // HAFF expansion: $3B/yr to social housing
+    setFdfContrib(5); setDrfContrib(8);          // Climate-resilient agriculture + disasters
+    setCefcContrib(25);            // CEFC tripled — Rewiring the Nation acceleration
+    setNrfcContrib(20);            // NRFC doubled — sovereign manufacturing
+    // Establish all new proposed funds
+    setNewSoverFund(true); setNewSoverFundCapB(100); setNewSoverFundContribAnnual(15);
+    setNewGenFund(true); setNewGenFundCapB(40);
+    setNewInfraFund(true); setNewInfraFundCapB(50);
+  };
+
+  // 4. Centrist / Treasury Orthodoxy — Henry Tax Review's actual recommendations
+  //    plus modest budget repair. Stage 4 with $500k top-up; 25/28% company
+  //    progressive; halved CGT discount; trajectory to balance by 2028-29.
+  const applyPresetCentrist = () => {
+    resetAllDefaults();
+    setBrackets([
+      { id: 1, min: 0,       max: 18200,    rate: 0  },
+      { id: 2, min: 18201,   max: 45000,    rate: 15 },
+      { id: 3, min: 45001,   max: 135000,   rate: 30 },
+      { id: 4, min: 135001,  max: 190000,   rate: 37 },
+      { id: 5, min: 190001,  max: 500000,   rate: 45 },
+      { id: 6, min: 500001,  max: Infinity, rate: 47 },  // Modest top-up
+    ]);
+    setNextId(8);
+    setLitoMax(850);
+    setCompanyBrackets([
+      { id: 1, min: 0,         max: 50000,     rate: 25 },
+      { id: 2, min: 50000,     max: 500000,    rate: 25 },
+      { id: 3, min: 500000,    max: 5000000,   rate: 25 },
+      { id: 4, min: 5000000,   max: 50000000,  rate: 25 },
+      { id: 5, min: 50000000,  max: 250000000, rate: 25 },
+      { id: 6, min: 250000000, max: Infinity,  rate: 28 },  // Henry recommendation
+    ]);
+    setNextCompanyId(7);
+    // Henry CGT halving
+    setCgtDisc(40);
+    // Restrict negative gearing to new builds (Phase 5)
+    setNegGearNew(true);
+    // Super: modest Div 296 uplift
+    setSuperHB(35);
+    // Modest environmental excises
+    setCarbon(40); setTobacco(1.85); setAlcohol(0.75);
+    // Resource: modest PRRT reform
+    setPrrt(50);
+    // Trust: Henry Review integrity package (FTE restrictions, bucket co tightening,
+    // s.99B foreign trust integrity, loss recoupment) — not the aggressive measures
+    setTrustMinTaxRate(25); setTrustS99B(true); setTrustFTE(true);
+    setTrustBucketCo(true); setTrustLossRecoup(true);
+    // Multinational tax integrity
+    setThinCap(true); setWithholdRoy(35);
+    // Spending: gentle discipline
+    setAps(210); setNdisP(700); setNdisCost(74);
+    setDefence(2.1); setAid(5.5);
+    // Phase 5 measures kept
+    setLossCarry(true); setIawo(true); setPhiReform(true);
+  };
+
+  // 5. Georgist — Henry George's single tax. Land Value Tax as primary revenue
+  //    base; income/company tax cut aggressively; resource rents fully captured;
+  //    GST minimised; citizen's dividend in lieu of welfare programs.
+  const applyPresetGeorgist = () => {
+    resetAllDefaults();
+    setBrackets([
+      { id: 1, min: 0,       max: 50000,    rate: 0  },
+      { id: 2, min: 50001,   max: 150000,   rate: 15 },
+      { id: 3, min: 150001,  max: 500000,   rate: 25 },
+      { id: 4, min: 500001,  max: Infinity, rate: 35 },
+    ]);
+    setNextId(6);
+    setLitoMax(0);
+    setCompanyBrackets([
+      { id: 1, min: 0,         max: 50000,     rate: 15 },
+      { id: 2, min: 50000,     max: 500000,    rate: 15 },
+      { id: 3, min: 500000,    max: 5000000,   rate: 15 },
+      { id: 4, min: 5000000,   max: 50000000,  rate: 15 },
+      { id: 5, min: 50000000,  max: 250000000, rate: 15 },
+      { id: 6, min: 250000000, max: Infinity,  rate: 15 },
+    ]);
+    setNextCompanyId(7);
+    // The single tax — Henry George's central proposition
+    setLvt(2.0);
+    // Capital-labour equivalence (Henry George's foundational principle:
+    // unearned rents taxed; productive labour and capital taxed lightly and equally)
+    setCgtDisc(0);
+    // GST reduced (consumption taxes are regressive and inefficient)
+    setGstRate(5);
+    // Free trade
+    setCustoms(-50);
+    // Resource rents fully captured ("all rent belongs to the people")
+    setPrrt(100); setMinLevy(30); setLngLevy(8); setGasReserve(60);
+    // No wealth/estate tax (LVT continuously captures it)
+    setEstate(0); setWealth(0);
+    // Negative gearing restricted (unproductive land use)
+    setNegGear(100); setNegGearNew(true);
+    // Citizen's Dividend via uniform welfare payments
+    setPensRate(1400); setJsRate(1400); setDspRate(1400);
+    setYouthAllow(1400); setAustudy(1400);
+    // Infrastructure-heavy (development requires public capital)
+    setRoadRail(25); setOtherInfra(15); setHousingP(20);
+    setEduPerStu(11000);
+    setDefence(2.0); setAps(220);
+    // Modest environmental
+    setCarbon(50);
+  };
+
+  // 6. Climate Emergency / Green New Deal — climate as organising principle.
+  //    Carbon-tax dominated, massive green industrial policy via expanded GBEs,
+  //    coal phased out via 100% nationalisation, just transition for workers.
+  const applyPresetClimate = () => {
+    resetAllDefaults();
+    // Moderate progressivity (climate spending does redistributive work)
+    setBrackets([
+      { id: 1, min: 0,       max: 22000,    rate: 0  },
+      { id: 2, min: 22001,   max: 50000,    rate: 15 },
+      { id: 3, min: 50001,   max: 120000,   rate: 28 },
+      { id: 4, min: 120001,  max: 180000,   rate: 35 },
+      { id: 5, min: 180001,  max: 350000,   rate: 42 },
+      { id: 6, min: 350001,  max: Infinity, rate: 50 },
+    ]);
+    setNextId(8);
+    setLitoMax(1200);
+    setCompanyBrackets([
+      { id: 1, min: 0,         max: 50000,     rate: 25 },
+      { id: 2, min: 50000,     max: 500000,    rate: 25 },
+      { id: 3, min: 500000,    max: 5000000,   rate: 27 },
+      { id: 4, min: 5000000,   max: 50000000,  rate: 30 },
+      { id: 5, min: 50000000,  max: 250000000, rate: 33 },
+      { id: 6, min: 250000000, max: Infinity,  rate: 38 },
+    ]);
+    setNextCompanyId(7);
+    // Carbon price at IPCC mid-range social cost
+    setCarbon(200);
+    setFuel(65); setEvRUC(0); setEvSurcharge(0);  // EV incentive
+    // Environmental excises at upper end
+    setPlasticExcise(3); setSugarLevy(15); setSingleUsePlastic(0.75);
+    setEWasteLevy(20); setTyreLevy(2.5); setGamblingLevy(20); setVapesExcise(0.75);
+    setAlcoholHealth(8); setAirEmissions(80); setBatteryLevy(4);
+    // Resource taxes penal for fossil fuels
+    setPrrt(70); setLngLevy(8); setGasReserve(80);
+    // Fossil fuel nationalisation (managed phase-out)
+    setNatLNG(60); setNatCoalGen(100); setNatIronOre(0);
+    // Critical minerals onshored for security of green-tech supply
+    setGbeCritMin(true); setGbeCritMinCapB(12);
+    // Rewiring Australia at Whitlam-scale
+    setGbeRewiringCorp(true); setGbeRewiringCapB(25);
+    // Green manufacturing (solar, batteries, wind)
+    setGbeMfgCorp(true); setGbeMfgCapB(20);
+    // First Nations Wealth Fund (resource rents from Indigenous land)
+    setGbeFirstNations(true); setGbeFirstNatCapB(10);
+    // Climate spending (Capacity Investment Scheme tripled)
+    setCapInv(25); setEnvProg(15);
+    // Just transition fund nested in housing
+    setHousingP(20);
+    // Cuts to fossil fuel subsidies
+    setFtcRate(30); setFtcMining(false);
+    // CGT and trust reform (capital-labour equivalence)
+    setCgtDisc(25); setCgtMinTax(true); setNegGearNew(true);
+    setTrustMinTaxRate(25); setTrustBucketCo(true); setTrustS99B(true);
+    setTrustLossRecoup(true); setTrustFTE(true); setTrustStreaming(true); setTrustCgtDisc(true);
+    // Modest wealth/inheritance taxation (Greens-aligned, funds just transition)
+    setEstate(15); setWealth(0.5); setLvt(0.5);
+    // Public housing corp (just-transition worker accommodation in transition regions)
+    setGbeHousingCorp(true); setGbeHousingCapB(15);
+    // Development bank for green industries
+    setGbeRegBank(true); setGbeRegBankCapB(10);
+    // Climate justice: foreign aid uplift, Indigenous programs uplift
+    setAid(8.5); setIndig(8); setIndigHealth(5.5);
+    // Peace dividend
+    setDefence(1.8);
+    // Modest welfare uplifts
+    setJsRate(1000); setDspRate(1200);
+    // Universal services moderate
+    setDentalVision(8); setMentalHealth(11); setGpBulk(95);
+    setHelpIndexation(2.0); setUniSub(70);
+    // Phase 5 measures
+    setLossCarry(true); setIawo(true); setPhiReform(true);
+    // FUND EXPANSION — climate emergency response. CEFC and NRFC are
+    // the primary instruments for green industrial policy. HAFF supports
+    // just-transition worker housing.
+    setCefcContrib(50);            // CEFC tripled — Rewiring the Nation scaled up
+    setCefcTargetReturn(3.0);      // More concessional (crowds in more private capital)
+    setNrfcContrib(30);            // NRFC tripled — sovereign green manufacturing
+    setNrfcTargetReturn(4.0);      // Lower target = more risk tolerance for green-tech
+    setHaffContrib(15); setHaffDisburseAdj(2);  // Just-transition worker housing in coal regions
+    setFdfContrib(8); setFdfDisburseAdj(0.5);   // Climate-resilient agriculture
+    setDrfContrib(10); setDrfDisburseAdj(2);    // Increased natural disaster risk
+    setNewInfraFund(true); setNewInfraFundCapB(40);   // Green infrastructure fund
+  };
+
+  // 7. Protectionist — Deakinite "Australian Settlement" revival. The 1901-1980s
+  //    Australian compromise: high tariffs (Customs Tariff Act 1908 onwards),
+  //    wage arbitration (Harvester case 1907), state-supported industry,
+  //    sovereign manufacturing capability. Combines tariff revenue with
+  //    industrial policy via GBE establishment; protects against capital flight
+  //    while reducing dependence on imports. Contemporary advocates: parts of
+  //    Labor industrial wing, Bob Katter's KAP, supply-chain sovereignty hawks.
+  const applyPresetProtectionist = () => {
+    resetAllDefaults();
+    // Income tax: moderately progressive with middle-class focus (the
+    // Harvester "basic wage" principle — wages sufficient for family
+    // sustenance — translated into a generous threshold and 28% middle rate)
+    setBrackets([
+      { id: 1, min: 0,       max: 24000,    rate: 0  },
+      { id: 2, min: 24001,   max: 50000,    rate: 15 },
+      { id: 3, min: 50001,   max: 130000,   rate: 28 },
+      { id: 4, min: 130001,  max: 200000,   rate: 35 },
+      { id: 5, min: 200001,  max: 500000,   rate: 42 },
+      { id: 6, min: 500001,  max: Infinity, rate: 48 },
+    ]);
+    setNextId(8);
+    setLitoMax(1200);
+    // Company tax: small-business preference (22%), graduated up to capture
+    // multinationals whose presence undermines domestic industry
+    setCompanyBrackets([
+      { id: 1, min: 0,         max: 50000,     rate: 22 },
+      { id: 2, min: 50000,     max: 500000,    rate: 22 },
+      { id: 3, min: 500000,    max: 5000000,   rate: 25 },
+      { id: 4, min: 5000000,   max: 50000000,  rate: 28 },
+      { id: 5, min: 50000000,  max: 250000000, rate: 33 },
+      { id: 6, min: 250000000, max: Infinity,  rate: 38 },
+    ]);
+    setNextCompanyId(7);
+    // TARIFFS — the central Protectionist instrument. Substantial customs
+    // duty uplift across all imported manufactured goods (consistent with
+    // Customs Tariff Act 1908 logic, modernised)
+    setCustoms(50);
+    // Resource taxes: capture rents for industrial development
+    setPrrt(60); setMinLevy(10); setLngLevy(3); setGasReserve(50);
+    // Trust integrity (multinational profit shifting undermines tariff effectiveness)
+    setTrustMinTaxRate(25); setTrustS99B(true); setTrustFTE(true);
+    setThinCap(true); setWithholdRoy(40);
+    // FBT and tax expenditure reform — narrow the base for foreign-controlled
+    // operations
+    setFtcMining(false);
+    // Industrial GBE programme — the protectionist preset's signature
+    // (this is what differentiates it from mere tariff policy)
+    setGbeMfgCorp(true); setGbeMfgCapB(30);          // ASMC at $30B — strategic manufacturing
+    setGbeCritMin(true); setGbeCritMinCapB(15);      // ACMIC at $15B — critical minerals processing
+    setGbeRegBank(true); setGbeRegBankCapB(15);      // Development bank for SMEs and regional industry
+    setGbeHousingCorp(true); setGbeHousingCapB(10);  // Modest housing finance
+    setGbeRewiringCorp(true); setGbeRewiringCapB(8); // Energy sovereignty (transmission)
+    // Re-acquire strategic GBE assets
+    setReAcqPorts(75);                               // Ports of strategic significance
+    setReAcqAirports(51);                            // Majority airport control
+    setReAcqTelstra(51);                             // Telecommunications sovereignty
+    // Nationalise key extractive industries (resource sovereignty)
+    setNatLNG(40); setNatIronOre(30);
+    // Industrial subsidies via existing levers
+    setAgri(8);                                      // Rural support (Country Party tradition)
+    setRoadRail(20); setOtherInfra(12);              // Infrastructure for industry
+    // Defence: modest uplift (domestic manufacturing capability,
+    // not full sovereignty preset's level)
+    setDefence(2.5);
+    // APS: skilled trade workforce expansion (vocational, not professional)
+    setAps(245); setVetTafe(5.5);                    // TAFE expansion the centrepiece
+    // Working family supports (Harvester principle)
+    setFtbA(225); setFtbB(195); setChildcare(85);
+    setEarlyChild(3.5);
+    // Modest universal services
+    setDentalVision(5); setMentalHealth(10);
+    // Defence-aligned industrial policy
+    setNdisP(720); setNdisCost(78);                  // Preserve
+    // Aid reduced (focus on domestic capability building)
+    setAid(3.5);
+    // Phase 5 measures
+    setLossCarry(true); setIawo(true);
+    setNegGearNew(true);                             // Channel investment to new construction
+    // FUND DEPLOYMENT — industrial reconstruction
+    // NRFC is the central protectionist instrument (Husic/Albanese 2023 framing).
+    // Substantial top-up matches the Curtin-era nation-building scale.
+    setNrfcContrib(35);            // NRFC tripled — sovereign manufacturing capability
+    setNrfcTargetReturn(5.0);      // Slightly lower than current (industrial priority)
+    // CEFC retained but reduced (industrial policy focus, not climate)
+    setCefcContrib(10);
+    // Establish sovereign wealth fund funded by tariff revenue
+    // (Norwegian model adapted: tariffs replace oil rents as funding source)
+    setNewSoverFund(true); setNewSoverFundCapB(40); setNewSoverFundContribAnnual(8);
+    // National Infrastructure Investment Fund — supports industrial base
+    setNewInfraFund(true); setNewInfraFundCapB(35);
+    // Future Fund preserved — protectionist tradition respects accumulated public capital
+  };
+
+  // 8. Sovereignty / Defence-First — post-AUKUS strategic realism. Defence at
+  //    NATO-plus level (3.5-4% GDP), comprehensive re-acquisition of strategic
+  //    infrastructure, sovereign manufacturing for security-critical capability.
+  //    The animating fear is Pacific instability and supply chain dependence
+  //    on geopolitical adversaries. References: 2020 Defence Strategic Update,
+  //    AUKUS Trilateral Security Agreement 2021, Defence Strategic Review 2023.
+  const applyPresetSovereignty = () => {
+    resetAllDefaults();
+    // Income tax: Stage 4 plus a "defence repair levy" top bracket
+    // (precedent: the WWII Special War Levy and post-9/11 ANZAC Day debates)
+    setBrackets([
+      { id: 1, min: 0,       max: 18200,    rate: 0  },
+      { id: 2, min: 18201,   max: 45000,    rate: 15 },
+      { id: 3, min: 45001,   max: 135000,   rate: 30 },
+      { id: 4, min: 135001,  max: 190000,   rate: 37 },
+      { id: 5, min: 190001,  max: Infinity, rate: 47 },
+    ]);
+    setNextId(7);
+    // Company tax: modest progressivity (defence manufacturing benefits from
+    // SME-friendly rates; large multinationals pay more)
+    setCompanyBrackets([
+      { id: 1, min: 0,         max: 50000,     rate: 25 },
+      { id: 2, min: 50000,     max: 500000,    rate: 25 },
+      { id: 3, min: 500000,    max: 5000000,   rate: 25 },
+      { id: 4, min: 5000000,   max: 50000000,  rate: 27 },
+      { id: 5, min: 50000000,  max: 250000000, rate: 30 },
+      { id: 6, min: 250000000, max: Infinity,  rate: 32 },
+    ]);
+    setNextCompanyId(7);
+    // DEFENCE — 3.5% GDP, between current Albanese trajectory and US-equivalent
+    setDefence(3.5);
+    // Border and federal law enforcement uplift
+    setBorderForce(5.0); setAfp(3.5);
+    // Sovereign capability GBEs — the differentiator from Protectionist
+    setGbeMfgCorp(true); setGbeMfgCapB(25);     // Strategic manufacturing (steel, missiles, pharma)
+    setGbeCritMin(true); setGbeCritMinCapB(15); // Critical minerals (defence supply chain)
+    setGbeAnsto(150);                           // Nuclear capability (sub fuel, medical isotopes)
+    setGbeAirservices(200);                     // Aviation infrastructure
+    // Re-acquisition of strategic infrastructure (full control)
+    setReAcqPorts(100);                         // Strategic ports fully Commonwealth
+    setReAcqAirports(75);                       // Airports majority Commonwealth
+    setReAcqTelstra(51);                        // Telco sovereignty
+    setReAcqCommsBank(30);                      // Modest banking presence (strategic finance)
+    // Snowy Hydro at full Commonwealth control (energy security)
+    setGbeSnowyHydro(400);
+    // Modest tariffs on strategic categories (less than Protectionist)
+    setCustoms(15);
+    // Multinational tax integrity (foreign entities holding critical capability)
+    setThinCap(true); setWithholdRoy(35);
+    // Resource taxes: PRRT at 55% (capture rents for defence funding)
+    setPrrt(55); setGasReserve(30);
+    // Domestic gas reservation for industrial base
+    setLngLevy(2);
+    // Modest excise indexation
+    setTobacco(1.85); setAlcohol(0.75);
+    // Spending discipline elsewhere
+    setAps(225);                                // Slight uplift (defence APS)
+    setNdisP(700); setNdisCost(74);             // Eligibility reform
+    setAid(6); setIndig(7);                     // Maintain aid for Pacific influence (DFAT logic)
+    // Modest climate spending (energy security overlap)
+    setCapInv(10); setEnvProg(7);
+    // Phase 5 measures
+    setLossCarry(true); setIawo(true);
+    setHelpIndexation(3.0);                     // Reduced HELP indexation (graduate retention)
+    // FUND DEPLOYMENT — strategic capability funding
+    // Establish dedicated Defence Industry Investment Fund (AUKUS Pillar II)
+    setNewDefenceFund(true); setNewDefenceFundCapB(30);
+    // NRFC capital uplift directed to defence capability priority area
+    setNrfcContrib(15);            // Top-up beyond legislated $15B
+    setNrfcTargetReturn(6.0);      // Higher target acceptable (strategic priorities take precedence)
+    // Future Fund preserved (originally established for unfunded super liabilities;
+    // sovereign realism respects intergenerational fiscal commitments)
+    // CEFC retained at baseline (energy security has climate co-benefits)
+    // No fund dissolutions — sovereignty preset values institutional continuity
+  };
+
+  // 9. Demographic Transition — boomer-coalition political realism. Australian
+  //    politics is structurally shaped by an ageing electorate; this preset
+  //    prioritises pension, aged care, and asset preservation over working-age
+  //    welfare and intergenerational redistribution. Comparable to Japan's
+  //    structural budget pressures (where 70+ voters dominate). Politically
+  //    consistent: this is what an electorally-rational government does when
+  //    median voter age exceeds 50.
+  const applyPresetDemographic = () => {
+    resetAllDefaults();
+    // Income tax: Stage 4 unchanged (older voters benefit from existing thresholds)
+    setBrackets(DEFAULT_BRACKETS); setNextId(10);
+    setLitoMax(1000); setMedicare(2);
+    // Company tax: unchanged (boomers hold significant equity through super)
+    setCompanyBrackets(DEFAULT_COMPANY_BRACKETS); setNextCompanyId(7);
+    // Super: REDUCE Div 296 surcharge (politically popular with high-balance
+    // retirees; this is the demographic preset's most distinctive move)
+    setSuperHB(15);                              // Effectively abolish Div 296
+    setSuperEarn(15); setSuperConc(15);          // Preserve concessions
+    // CGT: increase the discount (protects asset values for older holders)
+    setCgtDisc(50); setPrimRes(0);               // Primary residence remains exempt
+    // No new wealth/inheritance taxes (intergenerational asset preservation)
+    setEstate(0); setWealth(0); setLvt(0);
+    // Negative gearing preserved (boomer landlords)
+    setNegGear(0); setNegGearNew(false);
+    // AGED CARE & PENSION — the preset's signature uplifts
+    setPensRate(1350);                           // Single rate +$200/fn
+    setPensAge(67);                              // No further raising
+    setPensAsset(900);                           // Generous assets test cutout
+    setInHome(45000);                            // In-home package average doubled
+    setResCare(95);                              // Govt share of residential care to 95%
+    // Health prioritisation (high-utilisation groups)
+    setGpRebate(75);                             // Higher Medicare rebates
+    setGpBulk(98);                               // Near-universal bulk-billing
+    setHospital(45);                             // Hospital funding uplift
+    setPbs(20);                                  // Reduced PBS co-pay (medication costs)
+    setMentalHealth(11);                         // Modest mental health uplift
+    setDentalVision(6);                          // Limited adult dental (politically attractive)
+    setAcdc(1.5);                                // Aged care quality + safety uplift
+    // Working-age welfare: CPI indexation only (no real-terms uplifts)
+    setJsRate(810); setDspRate(1150);            // Unchanged
+    setFtbA(195); setFtbB(170);                  // Unchanged
+    setYouthAllow(640); setAustudy(700);         // Unchanged
+    // NDIS: tightened (politically vulnerable in older electorates)
+    setNdisP(650); setNdisCost(70);              // Modest restriction
+    // Childcare: modest (declining political constituency)
+    setChildcare(58);                            // Unchanged
+    setEarlyChild(2.0);                          // Unchanged
+    // University: HELP indexation retained, modest changes
+    setHelpIndexation(4.0); setUniSub(45);       // Status quo
+    // Housing: modest help to buy (assists boomers transferring wealth to children)
+    setHelpToBuyExt(2.5);
+    // Climate: modest (lower political salience among older voters)
+    setCapInv(5); setEnvProg(5); setCarbon(0);
+    // Defence: modest (security-focused but not strategic-investment-led)
+    setDefence(2.2);
+    // APS: modest cuts
+    setAps(210);
+    // Foreign aid: cut (low political salience)
+    setAid(3.5);
+    // Modest sin tax indexation
+    setTobacco(1.85);
+    // FUND POSITIONING — preservation logic favours boomers
+    // Future Fund: original purpose (unfunded public servant super liabilities)
+    // is most acute as the boomer cohort retires. Preserve and modestly draw down.
+    setFfEarlyDraw(8);             // $8B/yr early drawdown for aged care expansion
+    setFfTargetReturn(4.0);        // Lower-risk mandate (preservation focus, not growth)
+    // MRFF: increase disbursement (medical research benefits older voters)
+    setMrffDisburseAdj(0.5);       // +$500M/yr to medical research
+    // DCAF: preserve (NDIS politically contested but legally entrenched)
+    // CEFC: partial wind-down (energy transition framed as costly to retirees)
+    setCefcSalePct(25);            // 25% liquidation = $7.6B one-off
+    // NRFC: similar wind-down
+    setNrfcSalePct(25);
+    // HAFF: maintain but no expansion (housing supply less politically salient
+    // for older voters who already own; the political constituency is younger)
+  };
+
+  // 10. Distributist — G.K. Chesterton, Hilaire Belloc, Catholic social teaching
+  //     (Rerum Novarum 1891, Quadragesimo Anno 1931, Centesimus Annus 1991).
+  //     Anti-monopoly, pro-small-business, pro-family, pro-widely-distributed
+  //     property. Distinct from libertarianism (individualist, market-absolutist)
+  //     and conservatism (accepts large corporations). Australian heritage:
+  //     B.A. Santamaria's Movement, DLP, parts of the Catholic Labor tradition.
+  //     The animating principle is subsidiarity — economic decisions made at
+  //     the smallest competent unit (family, parish, town, region).
+  const applyPresetDistributist = () => {
+    resetAllDefaults();
+    // Income tax: family-friendly with strong middle support (the "living wage"
+    // tradition: families need sufficient income to support children)
+    setBrackets([
+      { id: 1, min: 0,       max: 24000,    rate: 0  },
+      { id: 2, min: 24001,   max: 50000,    rate: 15 },
+      { id: 3, min: 50001,   max: 130000,   rate: 25 },  // Middle-class relief
+      { id: 4, min: 130001,  max: 200000,   rate: 35 },
+      { id: 5, min: 200001,  max: 500000,   rate: 42 },
+      { id: 6, min: 500001,  max: Infinity, rate: 48 },
+    ]);
+    setNextId(8);
+    setLitoMax(1500);                            // Boost low-income workers
+    // Company tax: STEEPLY graduated — the distributist signature.
+    // Small businesses favoured aggressively; monopolistic large entities
+    // taxed hard. Implements the "small is beautiful" / Schumacher principle.
+    setCompanyBrackets([
+      { id: 1, min: 0,         max: 50000,     rate: 20 },  // Microbusiness preference
+      { id: 2, min: 50000,     max: 500000,    rate: 22 },  // Small business
+      { id: 3, min: 500000,    max: 5000000,   rate: 26 },  // SME
+      { id: 4, min: 5000000,   max: 50000000,  rate: 30 },  // Mid-market
+      { id: 5, min: 50000000,  max: 250000000, rate: 35 },  // Large
+      { id: 6, min: 250000000, max: Infinity,  rate: 42 },  // Large corporates (heavy)
+    ]);
+    setNextCompanyId(7);
+    // MONOPOLY LEVY — the distributist's central anti-concentration tool
+    setMonopolyLevy(15);                         // Heavy levy on monopolistic excess profits
+    setDigitalSvc(6);                            // Big Tech specifically (subsidiarity violation)
+    // Trust integrity (large family trusts undermine distributism's small-property ideal)
+    setTrustMinTaxRate(30); setTrustBucketCo(true); setTrustS99B(true);
+    setTrustFTE(true); setTrustStreaming(true);
+    // CGT: modest discount (capital ownership widely distributed is good;
+    // capital concentration is bad — handled via wealth/monopoly levers)
+    setCgtDisc(40);
+    setNegGearNew(true);                         // Channel investment to new construction
+    // Wealth taxes: modest, targeting concentration not ownership itself
+    setLvt(1.0);                                 // LVT prevents land monopolisation
+    setEstate(20);                               // Inheritance tax above threshold prevents dynasties
+    setWealth(0);                                // No general wealth tax (small property protected)
+    // Resource taxes: rents captured for community benefit
+    setPrrt(60); setMinLevy(10); setLngLevy(2); setGasReserve(40);
+    // FAMILY SUPPORTS — distributist signature
+    setFtbA(280); setFtbB(250);                  // Significant family payment uplift
+    setChildcare(85);                            // Subsidised childcare (acknowledging working mothers)
+    setEarlyChild(3.5);
+    setYouthAllow(900); setAustudy(900);         // Support young people (vocational pathway)
+    // Vocational education prioritised over university (Schumacher's "small is beautiful")
+    setVetTafe(5);                               // TAFE uplift
+    setEduPerStu(10000);                         // Strong public schooling
+    setUniSub(60);                               // Modest uni subsidy
+    setRegHigherEd(1.0);                         // Regional university equity
+    setHelpIndexation(2.0);                      // CPI-bounded HELP indexation
+    // Healthcare: universal but Medicare-via-state-not-federal style
+    setGpBulk(96); setGpRebate(60); setHospital(42);
+    setPbs(20); setMentalHealth(11);
+    setDentalVision(8);                          // Modest dental/vision (life-stage approach)
+    // GBE programme: small-scale, decentralised
+    setGbeRegBank(true); setGbeRegBankCapB(12);  // Regional development bank — SUBSIDIARITY IN ACTION
+    setGbeHousingCorp(true); setGbeHousingCapB(15); // Housing for ownership, not rental
+    setGbeMfgCorp(true); setGbeMfgCapB(10);      // Strategic manufacturing (regional jobs)
+    // Re-acquire utilities (subsidiarity favours public utility ownership)
+    setReAcqTelstra(40);                         // Modest stake
+    // Housing: strong support for OWNERSHIP (not rental)
+    setHousingP(22);                             // Significant housing investment
+    setHelpToBuyExt(3.5);                        // Stronger help to buy (widely-distributed property)
+    // Welfare: support for vulnerable, not generalised
+    setJsRate(950); setDspRate(1250);            // Modest uplift
+    setPensRate(1250);                           // Modest pension uplift
+    // Indigenous programs (Catholic social teaching emphasises solidarity)
+    setIndig(8); setIndigHealth(6);
+    // APS: modest expansion (active state, but not large)
+    setAps(225);
+    // Defence: modest (subsidiarity prefers local capability over global projection)
+    setDefence(2.2);
+    // Foreign aid: maintained (Catholic social teaching on global solidarity)
+    setAid(6);
+    // Environment: stewardship of creation principle
+    setCarbon(60); setCapInv(12); setEnvProg(9);
+    setSugarLevy(15); setGamblingLevy(25);       // Anti-vice excises
+    setAlcoholHealth(5);
+    // Phase 5 measures
+    setLossCarry(true); setIawo(true); setPhiReform(true);
+  };
+
+  const S = {
+    root:  { background:"#252830", minHeight:"100vh",
+             fontFamily:"'JetBrains Mono','IBM Plex Mono','Fira Code','Source Code Pro','Courier New',Menlo,monospace",
+             color:"#dadde3", fontSize:13, WebkitFontSmoothing:"antialiased" },
+    hdr:   { background:"linear-gradient(180deg,#2d3139 0%,#252830 100%)", borderBottom:"1px solid #4a4f59", padding:"13px 20px", position:"sticky", top:0, zIndex:100 },
+    dash:  { background:"#2d3139", borderBottom:"1px solid #4a4f59", padding:"14px 20px 16px" },
+    col:   { padding:"12px 14px", borderRight:"1px solid #4a4f59" },
+    colR:  { padding:"12px 14px" },
+    card:  { background:"#2d3139", border:"1px solid #4a4f59", borderRadius:6, padding:10 },
+    note:  { background:"#2d3139", borderRadius:4, padding:"6px 10px", fontSize:11, color:"#6e7480" },
+    bi:    { background:"#2a2d34", border:"1px solid #4a4f59", color:"#9bbef7", padding:"3px 6px",
+             borderRadius:3, width:64, fontSize:12, fontFamily:"inherit" },
+    btn:   (bg, cl) => ({ background:bg, color:cl, border:"none", cursor:"pointer",
+                           borderRadius:3, padding:"3px 10px", fontSize:11, fontFamily:"inherit" }),
+  };
+
+  return (
+    <CollapseCtx.Provider value={globalExpand}>
+    <div style={S.root}>
+      <style>{`
+        *,*::before,*::after{box-sizing:border-box}
+        body{margin:0}
+        input[type=range]{cursor:pointer;height:24px}
+        input[type=range]::-webkit-slider-thumb{cursor:pointer}
+        .numinput{background:#2a2d34;border:1px solid #4a4f59;color:#9bbef7;
+          padding:3px 6px;border-radius:3px;font-size:12px;font-family:inherit}
+        .numinput:focus{outline:1px solid #8fb4f0}
+
+        /* Section animation */
+        .sec-body{animation:fadeIn 0.2s ease-out}
+        @keyframes fadeIn{from{opacity:0;transform:translateY(-2px)}to{opacity:1;transform:none}}
+
+        /* Mobile responsive layout */
+        @media (max-width:820px){
+          .two-col{grid-template-columns:1fr !important}
+          .col-divider{border-right:none !important;border-bottom:1px solid #4a4f59}
+          .four-stat{grid-template-columns:repeat(2,1fr) !important}
+          .forward-grid{grid-template-columns:1fr !important}
+          .panel-pad{padding:10px 12px !important}
+          .hdr-title{font-size:12px !important;letter-spacing:0.02em !important}
+          .hdr-sub{font-size:9px !important;line-height:1.4 !important}
+          .balance-big{font-size:32px !important}
+          .bracket-grid{grid-template-columns:repeat(auto-fill,minmax(155px,1fr)) !important}
+          input[type=range]{height:32px}
+          input[type=range]::-webkit-slider-thumb{width:18px;height:18px}
+          .numinput{font-size:14px;padding:5px 7px}
+          .btn-row{flex-wrap:wrap}
+          .btn-row > button, .btn-row > span{flex:0 0 auto}
+          .gst-flow{grid-template-columns:1fr !important;gap:4px !important}
+          .three-tile{grid-template-columns:1fr 1fr 1fr !important;font-size:10px}
+          .three-tile div > div:nth-child(2){font-size:12px !important}
+          /* Forward estimates: card layout on tablet+ uses smaller table font */
+          .fe-table-wrap table{font-size:10px !important}
+          .fe-table-wrap th,.fe-table-wrap td{padding:4px 5px !important}
+          .fe-chart-box{height:240px !important}
+        }
+        @media (max-width:520px){
+          .four-stat{grid-template-columns:1fr 1fr !important}
+          .three-tile{grid-template-columns:1fr !important}
+          .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+          .hdr-title{font-size:11px !important}
+          .balance-big{font-size:28px !important}
+          /* Forward estimates on mobile: hide table, show card stack */
+          .fe-table-wrap{display:none !important}
+          .fe-cards{display:flex !important}
+          .fe-chart-box{height:260px !important}
+        }
+      `}</style>
+
+      {/* ── HEADER ── */}
+      <div style={S.hdr}>
+        <div className="hdr-title" style={{ fontSize:14, fontWeight:700, color:"#9bbef7", letterSpacing:"0.05em" }}>
+          🇦🇺  AUSTRALIAN FEDERAL BUDGET SIMULATOR — 2026-27 EDITION
+        </div>
+        <div className="hdr-sub" style={{ fontSize:10, color:"#7c828c", marginTop:2 }}>
+          Baseline: 2026-27 Budget (12 May 2026) · Receipts $798.1B · Payments $829.6B · UCB −$31.5B · GDP $3,094B · Headline deficit −1.0% GDP, structural −1.5% GDP (oil shock cyclical +0.5pp) · Second-order effects not modelled
+        </div>
+      </div>
+
+      {/* ── DASHBOARD ── */}
+      <div style={S.dash}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:16, flexWrap:"wrap" }}>
+          <div>
+            <div style={{ fontSize:10, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:2 }}>Budget Balance</div>
+            <div className="balance-big" style={{ fontSize:42, fontWeight:700, color: balance >= 0 ? "#7cb87a":"#d88c8c", lineHeight:1 }}>
+              {balance >= 0 ? "+" : "−"}${Math.abs(balance).toFixed(1)}B
+            </div>
+            <div style={{ fontSize:12, color:"#565c66", marginTop:4 }}>
+              {balance >= 0
+                ? `Surplus — ${(balance/GDP*100).toFixed(2)}% of GDP`
+                : `Deficit — need ${fmt(Math.abs(balance))} more to break even`}
+            </div>
+          </div>
+
+          <div style={{ textAlign:"center" }}>
+            <div style={{
+              width:66, height:66, borderRadius:"50%", background:"#2d3139",
+              border:`3px solid ${gc}`, display:"flex", alignItems:"center", justifyContent:"center",
+              fontSize:22, fontWeight:700, color:gc, margin:"0 auto"
+            }}>{gr}</div>
+            <div style={{ fontSize:10, color:"#7c828c", marginTop:4 }}>Grade</div>
+          </div>
+        </div>
+
+        {/* Balance bar */}
+        <div style={{ margin:"12px 0 8px" }}>
+          <div style={{ height:5, background:"#4a4f59", borderRadius:3, overflow:"hidden" }}>
+            <div style={{
+              width:`${barPct}%`, height:"100%", borderRadius:3, transition:"width 0.25s",
+              background: balance >= 0 ? "#5fa05c" : "#c06868"
+            }} />
+          </div>
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:9, color:"#7c828c", marginTop:2 }}>
+            <span>−$80B</span><span>Break even</span><span>+$60B</span>
+          </div>
+        </div>
+
+        {/* Stat cards */}
+        <div className="four-stat" style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginTop:12 }}>
+          {[
+            { l:"↑ Total Revenue",   v:`$${totalRev.toFixed(0)}B`,   s:`${(totalRev/GDP*100).toFixed(1)}% of GDP`,    c:revChange,           inv:false },
+            { l:"↓ Total Spending",  v:`$${totalSpend.toFixed(0)}B`, s:`${(totalSpend/GDP*100).toFixed(1)}% of GDP`,  c:spendChange,         inv:true  },
+            { l:"Net Improvement",   v:fmt(revChange-spendChange,true), s:"vs −$31.5B baseline UCB", c:revChange-spendChange, inv:false },
+            { l:"PDI (locked)",      v:`$${DEBT_INTEREST_BASE.toFixed(1)}B`, s:"→ $46.9B by 2029-30", c:0, inv:false, fixed:true },
+          ].map(item => (
+            <div key={item.l} style={S.card}>
+              <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.08em" }}>{item.l}</div>
+              <div style={{ fontSize:17, fontWeight:700, color:"#dadde3", marginTop:2 }}>{item.v}</div>
+              <div style={{ fontSize:10, color:"#565c66" }}>{item.s}</div>
+              <div style={{ fontSize:10, marginTop:3, fontWeight:700,
+                color: item.fixed ? "#8a909a" : ((!item.inv ? item.c >= 0 : item.c <= 0) ? "#7cb87a":"#d88c8c") }}>
+                {item.fixed ? "Public Debt Interest" : `${fmt(item.c, true)} from baseline`}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* GST flow display — shown only when GST levers are off-default */}
+        {(gstRate !== 10 || gstBase || gstRetain > 0) && (
+          <div style={{ marginTop:12, background:"#363a43", border:"1px solid #7c828c", borderRadius:5, padding:"10px 14px" }}>
+            <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:6 }}>GST Flow (Federal Financial Relations Act 2009)</div>
+            <div className="gst-flow" style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:8, fontSize:11 }}>
+              <div><span style={{ color:"#8a909a" }}>Total GST collected:&nbsp;</span><span style={{ color:"#9bbef7", fontWeight:700 }}>${gstTotalFlow.toFixed(1)}B</span></div>
+              <div><span style={{ color:"#8a909a" }}>Passed to states:&nbsp;</span><span style={{ color:"#d9b16c", fontWeight:700 }}>${gstToStates.toFixed(1)}B</span></div>
+              <div><span style={{ color:"#8a909a" }}>Cth retained:&nbsp;</span><span style={{ color: gstKeptByCth > 0 ? "#7cb87a" : "#6e7480", fontWeight:700 }}>${gstKeptByCth.toFixed(1)}B</span></div>
+            </div>
+          </div>
+        )}
+
+        {/* Analyse + Reset buttons */}
+        <div className="btn-row" style={{ display:"flex", gap:10, alignItems:"center", marginTop:14, flexWrap:"wrap" }}>
+          <button onClick={() => analyse(revChange, spendChange)} disabled={aiLoading}
+            style={{ background: aiLoading ? "#4a4f59" : "#3d556e", color: aiLoading ? "#565c66" : "#9bbef7",
+              border:"1px solid #7c828c", borderRadius:4, padding:"6px 18px", fontSize:11,
+              cursor: aiLoading ? "wait" : "pointer", fontFamily:"inherit" }}>
+            {aiLoading ? "Analysing…" : "✦  Analyse Budget"}
+          </button>
+
+          {/* Expand / Collapse all sections */}
+          <button onClick={() => { setGlobalExpand(true);  setTimeout(() => setGlobalExpand(null), 50); }}
+            style={{ background:"#2d3139", color:"#d9b16c", border:"1px solid #4a4f59",
+              borderRadius:4, padding:"6px 14px", fontSize:11, cursor:"pointer", fontFamily:"inherit" }}>
+            ⊞  Expand All
+          </button>
+          <button onClick={() => { setGlobalExpand(false); setTimeout(() => setGlobalExpand(null), 50); }}
+            style={{ background:"#2d3139", color:"#d9b16c", border:"1px solid #4a4f59",
+              borderRadius:4, padding:"6px 14px", fontSize:11, cursor:"pointer", fontFamily:"inherit" }}>
+            ⊟  Collapse All
+          </button>
+
+          <button onClick={() => {
+            resetAllDefaults();
+            setAiText(""); setGlobalExpand(null);
+          }} style={{ background:"#3d2020", color:"#d88c8c", border:"1px solid #8c5050",
+            borderRadius:4, padding:"6px 16px", fontSize:11, cursor:"pointer",
+            fontFamily:"inherit", fontWeight:600 }}>
+            ↺  Reset All
+          </button>
+
+          {/* Copy Inputs — copies a human-readable diff of changed levers to clipboard */}
+          <button onClick={copyInputs}
+            style={{ background: copyFeedback ? "#1e3d28" : "#2d3139",
+              color: copyFeedback ? "#7cb87a" : "#d9b16c",
+              border: `1px solid ${copyFeedback ? "#3a6e4a" : "#4a4f59"}`,
+              borderRadius:4, padding:"6px 14px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit", transition:"all 0.2s" }}>
+            {copyFeedback || "⎘  Copy Inputs"}
+          </button>
+
+          {/* Progressive Preset — calibrated to a social-democratic stance grounded in
+              the Whitlam-Curtin tradition with Henry Tax Review base-broadening. Designed
+              to retain a substantial surplus while genuinely redistributing the tax burden:
+              middle-class workers ($30k-$220k) receive material relief; the top 0.5% of
+              earners and the ATO Top 100 companies pay materially more. */}
+          <button onClick={() => {
+            // ── INCOME TAX — restoration of pre-Hawke progressivity ───────────────
+            //
+            // Australian top marginal rates over time:
+            //   1942-53  75%  (Curtin/Chifley, incl. Social Services Contribution)
+            //   1953-71  67-69%
+            //   1971-80  62-67%  (Whitlam restructure)
+            //   1980-86  60%   (stable consensus — Fraser also maintained)
+            //   1986-89  49%   (Hawke-Keating flattening — the neoliberal turn)
+            //   1989-2008 47%
+            //   2008+    45%   (historical low)
+            //
+            // This preset restores the 60% top rate that prevailed from 1980-86 — the
+            // last point at which the Australian tax system was unambiguously
+            // social-democratic in structure. Combined with 2% Medicare levy → 62%
+            // effective top rate, comparable to Sweden (~55%+municipal), Denmark (55.9%),
+            // Finland (~57%). Not radical by international standards; merely the pre-
+            // 1986 Australian consensus.
+            //
+            // The structure fixes the "missing middle" problem (Stage 4's flat 30% zone
+            // from $45k to $135k) by introducing a 25% rate at $50k-$100k. This is the
+            // core social-democratic move: the median full-time worker (~$67k) receives
+            // a marginal rate cut of 5pp, paid for by genuine progressivity at the top.
+            //
+            // Tax-free threshold raised to $24,000 (per Henry Tax Review's $25k target;
+            // $24k chosen to remain below the pool-2 midpoint at $24,100 for clean model
+            // behaviour — see calcIncomeTax in source).
+            //
+            // Two brackets above $500k recover Piketty-Saez-style progressivity on the
+            // top 0.5%, where capital-income and rent-extraction concentrate.
+            setBrackets([
+              { id: 1, min: 0,       max: 24000,    rate: 0  },  // Henry recommendation
+              { id: 2, min: 24001,   max: 50000,    rate: 15 },
+              { id: 3, min: 50001,   max: 100000,   rate: 25 },  // working/middle cut from 30%
+              { id: 4, min: 100001,  max: 150000,   rate: 32 },  // upper-middle
+              { id: 5, min: 150001,  max: 200000,   rate: 38 },
+              { id: 6, min: 200001,  max: 350000,   rate: 45 },  // upper-professional (Stage 4 top)
+              { id: 7, min: 350001,  max: 500000,   rate: 50 },
+              { id: 8, min: 500001,  max: 1000000,  rate: 55 },  // top 1%
+              { id: 9, min: 1000001, max: Infinity, rate: 60 },  // pre-Hawke restoration
+            ]);
+            setNextId(12);
+            setMedicare(2);    // Unchanged — Medicare levy already progressive (MLS adds top-up)
+            setLitoMax(1500);  // Raise low-income offset $700 → $1500 (boosts $20k-$66k workers)
+
+            // ── COMPANY TAX — top-100 progressivity with imputation in mind ───────
+            //
+            // Australia's dividend imputation system means a high statutory corporate
+            // rate is partially clawed back by domestic shareholders via franking
+            // credits. The headline rate therefore matters most for:
+            //   (a) foreign-owned multinationals (no franking benefit), and
+            //   (b) retained earnings (not yet distributed).
+            //
+            // ATO Corporate Tax Transparency data: roughly 50% of total company tax
+            // is paid by the ~100 largest entities, and effective rates for foreign-
+            // owned multinationals routinely sit 10-15pp below statutory. A genuinely
+            // social-democratic structure targets these specifically via a top
+            // bracket at 40% rather than spreading the rate increase evenly.
+            //
+            // Sectoral overlays (banking, supermarkets, telecoms, mining) are handled
+            // separately via monopolyLevy and PRRT below — not loaded into headline rate.
+            setCompanyBrackets([
+              { id: 1, min: 0,           max: 50000,     rate: 25 },  // microbusiness
+              { id: 2, min: 50000,       max: 500000,    rate: 25 },  // small business (current law)
+              { id: 3, min: 500000,      max: 5000000,   rate: 27 },  // SME
+              { id: 4, min: 5000000,     max: 50000000,  rate: 30 },  // mid-market (current standard)
+              { id: 5, min: 50000000,    max: 250000000, rate: 35 },  // large
+              { id: 6, min: 250000000,   max: Infinity,  rate: 40 },  // ATO Top 100 / multinationals
+            ]);
+            setNextCompanyId(7);
+
+            // ── GST — DO NOT remove food/health/education/childcare exemptions (regressive) ──
+            // Keep rate at 10%. Remove financial supplies (banking) — progressive.
+            setGstRate(10); setGstBase(false); setGstRetain(0);
+            setGstExFood(false); setGstExHealth(false); setGstExEducation(false);
+            setGstExChildcare(false); setGstExReligious(true); setGstExCharity(false);
+            setGstExRentRes(false); setGstExFinancial(true);
+            setGstExWaterSewer(false); setGstExPrecMetals(true);
+
+            // ── SUPERANNUATION — higher concessional rate for fairness ──
+            setSuperEarn(15); setSuperConc(20); setSuperHB(40);  // Div 296 raised to 40% (mirrors 60% top income rate)
+
+            // ── CGT — reduce discount, restore some indexation via Phase 5 ──
+            setCgtDisc(25); setPrimRes(0); setCgtMinTax(true);
+
+            // ── NEGATIVE GEARING — full ring-fence ──
+            setNegGear(100); setNegGearNew(false);  // ring-fence supersedes new-builds-only
+
+            // ── FUEL — status quo (price increases regressive) ──
+            setFuel(50.8); setEvRUC(0); setEvSurcharge(0);
+            setHvRUC(25); setHvEvDiscount(80); // Modest HVRUC uplift; EV trucks 80% discounted
+
+            // ── TOBACCO/ALCOHOL — status quo on base rates ──
+            setTobacco(1.75); setAlcohol(0.70);
+
+            // ── RESOURCE TAXES — significant uplift ──
+            setPrrt(50); setMinLevy(3); setLngLevy(0.5); setGasReserve(10);
+
+            // ── FBT — tighten meaningfully ──
+            setFbtRate(47); setFbtExempt(0);
+            setFbtEV(true);          // Keep EV exemption (climate-positive)
+            setFbtNovated(false);    // Tighten novated leases
+            setFbtRemote(true);      // Keep remote area
+            setFbtEntertainment(false);  // Remove minor benefits exemption
+            setFbtParking(false);    // Remove parking exemption
+            setFbtChildcareWP(true); // Keep work-provided childcare
+            setFbtLaptops(true);     // Keep portable devices
+            setFbtLAFHA(false);      // Remove LAFHA
+            setFbtRelocation(true);  // Keep relocation
+            setFbtPBI(true);         // KEEP PBI/charity cap (essential for health/aged-care wages)
+            setFbtReligious(false);  // Remove religious exemption
+
+            // ── NEW TAXES — moderate progressive set ──
+            setLvt(0.2);             // Land value tax 0.2% (~$13B revenue)
+            setCarbon(50);           // Carbon price $50/t (~$5B; climate-aligned)
+            setEstate(10);           // Estate tax 10% on estates above threshold (~$3.5B)
+            setWealth(0);            // No wealth tax (politically extreme)
+            setFinTax(0);            // No FTT (modest revenue, market distortion)
+
+            // ── OTHER TAXES ──
+            setCustoms(0); setLuxCar(40); setWineEq(35);
+            setPmc(80);              // Modest passenger movement charge uplift
+
+            // ── TRUST TAXATION — full reform package ──
+            setTrustMinTaxRate(30);
+            setTrustBucketCo(true); setTrustS99B(true); setTrustLossRecoup(true);
+            setTrustFTE(true); setTrustStreaming(true); setTrustCgtDisc(true);
+
+            // ── COMPANY TAX MEASURES ──
+            setWato(250);        // Working Australian Tax Offset on (Budget default)
+            setLossCarry(true);  // Keep loss carry-back (small business support)
+            setIawo(true);       // Keep instant asset write-off
+
+            // ── ENVIRONMENTAL & HEALTH EXCISES — moderate set ──
+            setPlasticExcise(0.5); setSugarLevy(15);
+            setSingleUsePlastic(0.20); setEWasteLevy(15); setTyreLevy(2);
+            setGamblingLevy(15);  setVapesExcise(0.5);
+            setAlcoholHealth(10); setAirEmissions(40); setBatteryLevy(3);
+
+            // ── DIGITAL & MONOPOLY ──
+            setDigitalSvc(3); setMonopolyLevy(5);
+
+            // ── NATIONALISATION — small stakes only (preserve surplus) ──
+            setNatLNG(10); setNatIronOre(5);
+            setNatCoalGen(0);   // Coal already transitioning; no acquisition
+            setNatBanking(0);   // Too fiscally expensive
+
+            // ── TAX EXPENDITURES & WITHHOLDING ──
+            setFtcRate(100); setFtcMining(false); setFtcAg(true);  // Remove mining FTC (+$8B), keep ag
+            setMlsThreshold(80000); setMlsRate(1.5);  // Tighten MLS
+            setWithholdDiv(30); setWithholdInt(15); setWithholdRoy(35); // Modest withholding uplifts
+            setDiv293Thresh(200); setPaygInstalment(0);
+            setRdIncentive(43.5); setThinCap(true);
+
+            // ──────── SPENDING ────────
+
+            // ── WELFARE — humanist uplift ──
+            setPensRate(1200);   // +$50/fn pension
+            setPensAge(67); setPensAsset(700);
+            setJsRate(890);      // +$80/fn JobSeeker (towards ACOSS poverty-line target)
+            setJsCutout(1500);
+            setDspRate(1200); setDspPts(20);
+            setFtbA(210); setFtbB(180);
+            setChildcare(73);    // Childcare per child uplift
+            setYouthAllow(720); setAustudy(780);
+
+            // ── HEALTH — significant uplift ──
+            setGpBulk(95);       // Bulk-billing rate
+            setGpRebate(50);     // Rebate uplift
+            setHospital(40.4);   // +$3B hospital
+            setPbs(31.60);
+            setAcdc(1.0);        // ACDC ramp-up
+            setDentalVision(3);  // Universal dental & vision +$3B
+            setMentalHealth(9.4); // +$2B mental health
+            setIndigHealth(5.3); // +$1B Indigenous health
+            setPhiReform(true);  // PHI age-rebate removal saves $0.75B
+
+            // ── NDIS / Aged Care — maintain ──
+            setNdisP(720); setNdisCost(78);  // Baseline NDIS
+            setThrivingKids(0.5); setFoundSupports(0.4);  // Phase 5 NDIS-adjacent programs on
+            setInHome(24000); setResCare(75);  // Modest aged-care uplift
+
+            // ── EDUCATION ──
+            setEduPerStu(8300);  // +$500/student
+            setUniRes(11.5); setUniSub(50); setRegHigherEd(0.5);
+            setCsiroFund(1.3); setNhmrcFund(1.5); setArcFund(1.0);
+            setVetTafe(3.6);     // +$1B TAFE/VET
+            setEarlyChild(3.0);  // +$1B early childhood
+
+            // ── DEFENCE — humanist limit at 2.02% GDP ──
+            setDefence(2.02);    // No uplift; current trajectory maintained
+            setVets(13.2);       // Modest veterans uplift
+
+            // ── INFRASTRUCTURE / APS / CLIMATE ──
+            setRoadRail(15.3); setOtherInfra(9);
+            setLocalInfraFund(0.40);  // Local Infrastructure Fund uplift
+            setAps(225); setApsWage(2);  // Modest APS expansion + 2% wage
+            setCapInv(11); setEnvProg(10); // Climate capex +$3B; env programs +$3B
+
+            // ── OTHER SPENDING ──
+            setAid(7.1);         // ODA uplift +$2B
+            setHousingP(13.4); setHelpToBuyExt(2.0);  // Housing +$2B
+            setIndig(7); setAgri(5); setImmig(5); setArts(2.5);
+            setAfp(2.4); setBorderForce(2.8);
+
+            // ── HELP / HIGHER ED ──
+            setHelpIndexation(2.0);  // 2% indexation (CPI-bounded)
+
+            // ── State commitments — keep current Budget allocations ──
+            // (No changes — these are existing programmes; preset doesn't reshape them.)
+
+            // ── COMMONWEALTH ENTERPRISES — establish 3 strategic corporations ──
+            setGbeAusPost(50); setGbeNBN(0); setGbeSnowyHydro(0);
+            setGbeDefHousing(20); setGbeAnsto(0); setGbeAirservices(20);
+            setGbeMint(0); setGbeAusTrade(0); setGbeAssetSales(0);
+            setReAcqTelstra(0); setReAcqAirports(0); setReAcqPorts(0); setReAcqCommsBank(0);
+            setGbeNewCorp(false);
+            setGbeHousingCorp(true);  setGbeHousingCapB(15);   // CHFC for affordable housing
+            setGbeMfgCorp(false);
+            setGbeCritMin(false);
+            setGbeRegBank(false);
+            setGbeRewiringCorp(true); setGbeRewiringCapB(8);   // Transmission financing
+            setGbeFirstNations(true); setGbeFirstNatCapB(6);   // FNF sovereign-wealth model
+
+            // Investment fund expansions — Progressive social-democratic baseline
+            // Modest fund expansions consistent with the preset's overall scale
+            setMrffContrib(5); setMrffDisburseAdj(0.5);    // MRFF: +$5B, +$0.5B/yr disbursement
+            setHaffContrib(10); setHaffDisburseAdj(1.0);   // HAFF: +$10B, +$1B/yr housing
+            setCefcContrib(15);                            // CEFC: +$15B (Rewiring + battery scale-up)
+            setNrfcContrib(10);                            // NRFC: +$10B (green manufacturing)
+            setFdfContrib(2); setDrfContrib(3);            // Climate-resilient supports
+
+            setAiText(""); setGlobalExpand(null);
+          }} style={{ background:"#1f3a2c", color:"#7cb87a", border:"1px solid #3a6e4a",
+            borderRadius:4, padding:"6px 16px", fontSize:11, cursor:"pointer",
+            fontFamily:"inherit", fontWeight:600 }}>
+            ⚖  Progressive Preset
+          </button>
+          <button onClick={exportSettings}
+            style={{ background:"#2d3139", color:"#9bbef7", border:"1px solid #4a4f59",
+              borderRadius:4, padding:"6px 14px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit" }}>
+            ⬇  Export JSON
+          </button>
+          <button onClick={() => importInputRef.current?.click()}
+            style={{ background:"#2d3139", color:"#9bbef7", border:"1px solid #4a4f59",
+              borderRadius:4, padding:"6px 14px", fontSize:11, cursor:"pointer",
+              fontFamily:"'Courier New',Menlo,monospace" }}>
+            ⬆  Import (.json / .txt)
+          </button>
+          <input ref={importInputRef} type="file" accept="application/json,.json,text/plain,.txt"
+            onChange={importSettings} style={{ display: "none" }} />
+
+          {/* Paste Inputs — apply scenario from clipboard text (Copy Inputs round-trip) */}
+          <button onClick={() => { setPasteOpen(!pasteOpen); setPasteFeedback(''); }}
+            style={{ background: pasteOpen ? "#3a3540" : "#2d3139",
+              color:"#c8a8d8", border:"1px solid #5a4a5e",
+              borderRadius:4, padding:"6px 14px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit" }}>
+            {pasteOpen ? "▼  Paste Inputs" : "▶  Paste Inputs"}
+          </button>
+          <span style={{ fontSize:10, color:"#7c828c" }}>Analyse uses a small amount of Claude usage per click.</span>
+        </div>
+
+        {/* ── PRESET LIBRARY ROW ────────────────────────────────────────────
+            Six additional preset positions spanning the recognisable
+            political-economic traditions. Each calls resetAllDefaults() then
+            applies its overrides, ensuring no stale state leaks between
+            presets. Tooltips on hover explain each preset's philosophy. */}
+        <div className="preset-row" style={{ display:"flex", gap:8, alignItems:"center",
+          marginTop:10, flexWrap:"wrap", paddingTop:10, borderTop:"1px dashed #3a3f48" }}>
+          <span style={{ fontSize:10, color:"#7c828c", textTransform:"uppercase",
+            letterSpacing:"0.08em", marginRight:4 }}>Other presets:</span>
+
+          <button onClick={() => { applyPresetConservative(); setAiText(""); setGlobalExpand(null); }}
+            title="Coalition Treasury orthodoxy — Stage 4 maintained, 25% flat company tax (Howard target), Div 296 repealed, 2.5% defence (Dutton target), 8% APS cut, NDIS eligibility reform"
+            style={{ background:"#1f2d3a", color:"#7c9bc8", border:"1px solid #3a4f6e",
+              borderRadius:4, padding:"6px 12px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit", fontWeight:600 }}>
+            ⚙  Fiscally Conservative
+          </button>
+
+          <button onClick={() => { applyPresetCentrist(); setAiText(""); setGlobalExpand(null); }}
+            title="Treasury orthodoxy / Henry Tax Review — modest base broadening, halved CGT discount, trajectory to balance by 2028-29"
+            style={{ background:"#2d3139", color:"#9da3ae", border:"1px solid #4a4f59",
+              borderRadius:4, padding:"6px 12px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit", fontWeight:600 }}>
+            ⊙  Centrist (Treasury)
+          </button>
+
+          <button onClick={() => { applyPresetMaxProgressive(); setAiText(""); setGlobalExpand(null); }}
+            title="Curtin restoration + Piketty-Saez + MMT — 75% top income rate, 50% top company rate, full wealth taxation, universal services free at point of use"
+            style={{ background:"#3a1f2d", color:"#c87ca5", border:"1px solid #6e3a4f",
+              borderRadius:4, padding:"6px 12px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit", fontWeight:600 }}>
+            ⚑  Maximalist Progressive
+          </button>
+
+          <button onClick={() => { applyPresetLibertarian(); setAiText(""); setGlobalExpand(null); }}
+            title="LDP / Friedman / Hayek — two-bracket flat-ish income tax, 22% flat company tax, comprehensive privatisation, GST broadened, severe spending cuts"
+            style={{ background:"#3a1f1f", color:"#c87c7c", border:"1px solid #6e3a3a",
+              borderRadius:4, padding:"6px 12px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit", fontWeight:600 }}>
+            ✕  Libertarian
+          </button>
+
+          <button onClick={() => { applyPresetGeorgist(); setAiText(""); setGlobalExpand(null); }}
+            title="Henry George single-tax — LVT at 2%/yr as primary revenue, 15% flat company tax, full resource rent capture, citizen's dividend in lieu of welfare programs"
+            style={{ background:"#3a311f", color:"#d9b16c", border:"1px solid #6e5f3a",
+              borderRadius:4, padding:"6px 12px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit", fontWeight:600 }}>
+            ⌂  Georgist
+          </button>
+
+          <button onClick={() => { applyPresetClimate(); setAiText(""); setGlobalExpand(null); }}
+            title="Climate Emergency / Green New Deal — carbon price at $200/t, 100% coal nationalisation phase-out, Whitlam-scale Rewiring Australia + green manufacturing, just transition"
+            style={{ background:"#1f3a2d", color:"#7cc8a5", border:"1px solid #3a6e5f",
+              borderRadius:4, padding:"6px 12px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit", fontWeight:600 }}>
+            ☘  Climate Emergency
+          </button>
+
+          <button onClick={() => { applyPresetProtectionist(); setAiText(""); setGlobalExpand(null); }}
+            title="Deakinite Australian Settlement — 50% tariff uplift (Customs Tariff Act 1908 logic), ASMC $30B, critical minerals processing, ports/airports re-acquisition, Harvester-style family supports"
+            style={{ background:"#3a2d1f", color:"#c89c7c", border:"1px solid #6e5a3a",
+              borderRadius:4, padding:"6px 12px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit", fontWeight:600 }}>
+            ⚒  Protectionist
+          </button>
+
+          <button onClick={() => { applyPresetSovereignty(); setAiText(""); setGlobalExpand(null); }}
+            title="Post-AUKUS strategic realism — defence 3.5% GDP, 100% port re-acquisition, ANSTO + critical minerals + strategic manufacturing GBEs, 5% Border Force, $190k+ defence levy"
+            style={{ background:"#2d2d3a", color:"#9c9cc8", border:"1px solid #5a5a6e",
+              borderRadius:4, padding:"6px 12px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit", fontWeight:600 }}>
+            ⚔  Sovereignty / Defence-First
+          </button>
+
+          <button onClick={() => { applyPresetDemographic(); setAiText(""); setGlobalExpand(null); }}
+            title="Boomer-coalition realism — pension +$200/fn, in-home aged care doubled, Div 296 effectively repealed, primary residence preserved, working-age welfare frozen, NDIS tightened"
+            style={{ background:"#3a2d2d", color:"#c89c9c", border:"1px solid #6e5a5a",
+              borderRadius:4, padding:"6px 12px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit", fontWeight:600 }}>
+            ⌛  Demographic Transition
+          </button>
+
+          <button onClick={() => { applyPresetDistributist(); setAiText(""); setGlobalExpand(null); }}
+            title="Catholic social teaching / Chesterton-Belloc — small-business preference (20-22% rate), monopoly levy 15%, FTB +$280/fn, LVT 1% prevents land monopolisation, estate tax 20%, regional development bank"
+            style={{ background:"#3a1f3a", color:"#c87cc8", border:"1px solid #6e3a6e",
+              borderRadius:4, padding:"6px 12px", fontSize:11, cursor:"pointer",
+              fontFamily:"inherit", fontWeight:600 }}>
+            ⚜  Distributist
+          </button>
+        </div>
+
+        {/* Expandable paste-import panel */}
+        {pasteOpen && (
+          <div style={{ marginTop:10, background:"#2a2e36", border:"1px solid #4a4f59",
+            borderRadius:5, padding:"10px 12px" }}>
+            <div style={{ fontSize:10, color:"#9da3ae", marginBottom:6, lineHeight:1.5 }}>
+              Paste the full Copy Inputs text (or just the <code style={{color:"#c8a8d8"}}>&lt;&lt;&lt;BUDGET_SIM_v1...BUDGET_SIM_v1&gt;&gt;&gt;</code> block, or raw scenario JSON).
+              The Import path will detect the embedded data and restore all levers.
+            </div>
+            <textarea value={pasteText} onChange={(e) => setPasteText(e.target.value)}
+              placeholder="Paste Copy Inputs text or scenario JSON here..."
+              spellCheck={false}
+              style={{ width:"100%", minHeight:100, maxHeight:240,
+                background:"#1f232a", color:"#c8d0dc",
+                border:"1px solid #3a3f48", borderRadius:4, padding:"8px 10px",
+                fontFamily:"'Courier New',Menlo,monospace", fontSize:11,
+                resize:"vertical", boxSizing:"border-box" }} />
+            <div style={{ display:"flex", gap:8, marginTop:8, alignItems:"center" }}>
+              <button onClick={handlePasteApply}
+                style={{ background: pasteFeedback.startsWith('✓') ? "#1e3d28"
+                  : pasteFeedback.startsWith('✗') ? "#3d2020" : "#2d3a4f",
+                  color: pasteFeedback.startsWith('✓') ? "#7cb87a"
+                  : pasteFeedback.startsWith('✗') ? "#d88c8c" : "#9bbef7",
+                  border:`1px solid ${pasteFeedback.startsWith('✓') ? "#3a6e4a"
+                    : pasteFeedback.startsWith('✗') ? "#8c5050" : "#4a5f7a"}`,
+                  borderRadius:4, padding:"6px 14px", fontSize:11, cursor:"pointer",
+                  fontFamily:"inherit", fontWeight:600 }}>
+                {pasteFeedback || "Apply scenario"}
+              </button>
+              <button onClick={() => { setPasteText(''); setPasteFeedback(''); }}
+                style={{ background:"#2d3139", color:"#9da3ae",
+                  border:"1px solid #4a4f59", borderRadius:4,
+                  padding:"6px 12px", fontSize:11, cursor:"pointer",
+                  fontFamily:"inherit" }}>
+                Clear
+              </button>
+              <span style={{ fontSize:10, color:"#7c828c", marginLeft:"auto" }}>
+                {pasteText ? `${pasteText.length.toLocaleString()} characters` : ""}
+              </span>
+            </div>
+          </div>
+        )}
+        {aiText && (
+          <div style={{ marginTop:12, background:"#363a43", border:"1px solid #7c828c", borderRadius:5, padding:"12px 14px" }}>
+            <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:8 }}>✦  AI Fiscal Analysis</div>
+            <div style={{ fontSize:12, color:"#9da3ae", lineHeight:1.75, whiteSpace:"pre-wrap" }}>{aiText}</div>
+          </div>
+        )}
+      </div>
+
+      {/* ── FORWARD ESTIMATES PANEL ────────────────────────────────────────── */}
+      <div className="panel-pad" style={{ background:"#2a2d34", borderBottom:"1px solid #4a4f59", padding:"14px 20px 18px" }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:10, flexWrap:"wrap", gap:6 }}>
+          <div style={{ fontSize:11, color:"#9bbef7", fontWeight:700, letterSpacing:"0.05em" }}>
+            FORWARD ESTIMATES &amp; MEDIUM-TERM PROJECTION
+          </div>
+          <div style={{ fontSize:10, color:"#7c828c" }}>
+            BP1 Statement 3 · Real-terms persistence; debt-interest cascade modelled at 4.0% yield
+          </div>
+        </div>
+
+        <div className="forward-grid" style={{ display:"grid", gridTemplateColumns:"1.4fr 1fr", gap:14, alignItems:"start" }}>
+
+          {/* Table — desktop full, mobile card-stacked */}
+          <div style={{ background:"#2d3139", border:"1px solid #4a4f59", borderRadius:5, padding:"10px 12px" }}>
+            {/* Desktop table — hidden below 520px via CSS */}
+            <div className="fe-table-wrap" style={{ overflowX:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
+                <thead>
+                  <tr style={{ borderBottom:"1px solid #4a4f59" }}>
+                    {["Year","GDP $B","Baseline UCB","User UCB","Δ vs base","Cum. Δ","Gross debt %"].map(h => (
+                      <th key={h} style={{ padding:"5px 6px", textAlign:"left", color:"#7c828c", fontWeight:500, whiteSpace:"nowrap" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {forwardEstimates.map((r, i) => (
+                    <tr key={r.year} style={{ borderBottom:"1px solid #2d3139" }}>
+                      <td style={{ padding:"5px 6px", color:"#c0c4cd", whiteSpace:"nowrap" }}>{r.year}</td>
+                      <td style={{ padding:"5px 6px", color:"#8a909a" }}>{r.gdp.toLocaleString()}</td>
+                      <td style={{ padding:"5px 6px", color: r.baselineUcb >= 0 ? "#7cb87a" : "#d88c8c", whiteSpace:"nowrap" }}>
+                        {r.baselineUcb >= 0 ? "+" : "−"}${Math.abs(r.baselineUcb).toFixed(1)}B
+                        <span style={{ color:"#565c66", marginLeft:4 }}>({r.baselineUcbPct.toFixed(1)}%)</span>
+                      </td>
+                      <td style={{ padding:"5px 6px", color: r.userUcb >= 0 ? "#7cb87a" : "#d88c8c", fontWeight:600, whiteSpace:"nowrap" }}>
+                        {r.userUcb >= 0 ? "+" : "−"}${Math.abs(r.userUcb).toFixed(1)}B
+                        <span style={{ color:"#565c66", marginLeft:4, fontWeight:400 }}>({r.userUcbPct.toFixed(1)}%)</span>
+                      </td>
+                      <td style={{ padding:"5px 6px", color: r.yearNet >= 0 ? "#7cb87a" : "#d88c8c", whiteSpace:"nowrap" }}>
+                        {fmt(r.yearNet, true)}
+                      </td>
+                      <td style={{ padding:"5px 6px", color: r.cumImprovement >= 0 ? "#7cb87a" : "#d88c8c", whiteSpace:"nowrap" }}>
+                        {fmt(r.cumImprovement, true)}
+                      </td>
+                      <td style={{ padding:"5px 6px", color:"#9bbef7", whiteSpace:"nowrap" }}>
+                        {r.userDebtPct.toFixed(1)}%
+                        {Math.abs(r.userDebtPct - r.baselineDebtPct) > 0.05 && (
+                          <span style={{ color:"#565c66", marginLeft:4 }}>
+                            (base {r.baselineDebtPct.toFixed(1)}%)
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Mobile card-stack — visible below 520px via CSS. One card per year. */}
+            <div className="fe-cards" style={{ display:"none", flexDirection:"column", gap:8 }}>
+              {forwardEstimates.map(r => (
+                <div key={r.year} style={{ background:"#252830", border:"1px solid #3a3f48",
+                  borderRadius:4, padding:"8px 10px" }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline",
+                    marginBottom:6, paddingBottom:4, borderBottom:"1px solid #3a3f48" }}>
+                    <span style={{ fontSize:13, fontWeight:700, color:"#c0c4cd" }}>{r.year}</span>
+                    <span style={{ fontSize:10, color:"#7c828c" }}>GDP ${r.gdp.toLocaleString()}B</span>
+                  </div>
+
+                  {/* Two-column grid of metric rows */}
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"6px 10px", fontSize:11 }}>
+                    <div>
+                      <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.05em" }}>Baseline UCB</div>
+                      <div style={{ color: r.baselineUcb >= 0 ? "#7cb87a" : "#d88c8c", fontWeight:500 }}>
+                        {r.baselineUcb >= 0 ? "+" : "−"}${Math.abs(r.baselineUcb).toFixed(1)}B
+                        <span style={{ color:"#565c66", fontSize:10, marginLeft:3 }}>({r.baselineUcbPct.toFixed(1)}%)</span>
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.05em" }}>User UCB</div>
+                      <div style={{ color: r.userUcb >= 0 ? "#7cb87a" : "#d88c8c", fontWeight:700 }}>
+                        {r.userUcb >= 0 ? "+" : "−"}${Math.abs(r.userUcb).toFixed(1)}B
+                        <span style={{ color:"#565c66", fontSize:10, marginLeft:3, fontWeight:400 }}>({r.userUcbPct.toFixed(1)}%)</span>
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.05em" }}>Δ vs base</div>
+                      <div style={{ color: r.yearNet >= 0 ? "#7cb87a" : "#d88c8c", fontWeight:500 }}>
+                        {fmt(r.yearNet, true)}
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.05em" }}>Cumulative Δ</div>
+                      <div style={{ color: r.cumImprovement >= 0 ? "#7cb87a" : "#d88c8c", fontWeight:500 }}>
+                        {fmt(r.cumImprovement, true)}
+                      </div>
+                    </div>
+                    <div style={{ gridColumn:"1 / -1" }}>
+                      <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.05em" }}>Gross debt</div>
+                      <div style={{ color:"#9bbef7", fontWeight:500 }}>
+                        {r.userDebtPct.toFixed(1)}% GDP
+                        {Math.abs(r.userDebtPct - r.baselineDebtPct) > 0.05 && (
+                          <span style={{ color:"#565c66", marginLeft:6, fontSize:10 }}>
+                            (baseline {r.baselineDebtPct.toFixed(1)}%)
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* 5-year totals */}
+            <div className="three-tile" style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:8, marginTop:10, paddingTop:8, borderTop:"1px solid #4a4f59" }}>
+              <div>
+                <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.08em" }}>Cumulative 5-yr Δ</div>
+                <div style={{ fontSize:14, fontWeight:700, color: cumulativeImprovement >= 0 ? "#7cb87a" : "#d88c8c" }}>
+                  {fmt(cumulativeImprovement, true)}
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.08em" }}>Avoided debt-interest</div>
+                <div style={{ fontSize:14, fontWeight:700, color: cumulativePdiSaving >= 0 ? "#7cb87a" : "#d88c8c" }}>
+                  {fmt(cumulativePdiSaving, true)}
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.08em" }}>2030-31 debt vs base</div>
+                <div style={{ fontSize:14, fontWeight:700, color:"#9bbef7" }}>
+                  {(forwardEstimates[4].userDebtPct - forwardEstimates[4].baselineDebtPct).toFixed(1)}pp
+                </div>
+              </div>
+            </div>
+
+            <div style={{ fontSize:10, color:"#565c66", marginTop:8, lineHeight:1.5 }}>
+              Note: 2026-27 structural balance is −1.5% GDP (vs −1.0% headline UCB) due to the oil-price
+              shock&apos;s +0.5pp cyclical lift. By 2027-28 the cyclical contribution dissipates and the
+              structural and headline trajectories converge. Budget reaches balance in 2034-35 and
+              surplus of +0.8% GDP by 2036-37 (medium-term projection beyond chart horizon).
+            </div>
+          </div>
+
+          {/* Chart */}
+          <div className="fe-chart" style={{ background:"#2d3139", border:"1px solid #4a4f59", borderRadius:5, padding:"10px 12px 8px" }}>
+            <div style={{ fontSize:10, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:6 }}>
+              Underlying Cash Balance (% GDP)
+            </div>
+            <div className="fe-chart-box" style={{ width:"100%", height:210 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={forwardEstimates.map(r => ({
+                  year: r.year,
+                  baseline: parseFloat(r.baselineUcbPct.toFixed(2)),
+                  user:     parseFloat(r.userUcbPct.toFixed(2)),
+                  structural: r.structural,
+                }))}
+                  margin={{ top: 5, right: 8, left: -18, bottom: 0 }}>
+                  <CartesianGrid stroke="#4a4f59" strokeDasharray="3 3" />
+                  <XAxis dataKey="year" tick={{ fill:"#6e7480", fontSize:9 }} stroke="#7c828c"
+                    interval="preserveStartEnd" />
+                  <YAxis tick={{ fill:"#6e7480", fontSize:9 }} stroke="#7c828c"
+                    tickFormatter={v => `${v}%`} domain={["auto","auto"]} width={36} />
+                  <Tooltip
+                    contentStyle={{ background:"#282c34", border:"1px solid #7c828c", fontSize:11, color:"#c0c4cd" }}
+                    formatter={(value, name) => {
+                      const n = typeof value === "number" ? value : Number(value);
+                      return [Number.isFinite(n) ? `${n.toFixed(2)}% GDP` : String(value), name];
+                    }} />
+                  <ReferenceLine y={0} stroke="#6e7480" strokeDasharray="2 4"
+                    label={{ value: "Balance", fill:"#6e7480", fontSize:9, position:"insideTopRight" }} />
+                  <Line type="monotone" dataKey="baseline"   name="Baseline"  stroke="#d88c8c" strokeWidth={1.5} strokeDasharray="4 3" dot={{ r:2.5, fill:"#d88c8c" }} />
+                  <Line type="monotone" dataKey="user"       name="User"      stroke="#9bbef7" strokeWidth={2}   dot={{ r:3, fill:"#9bbef7" }} />
+                  <Line type="monotone" dataKey="structural" name="Structural" stroke="#d9b16c" strokeWidth={1} strokeDasharray="2 4" dot={false} />
+                  <Legend wrapperStyle={{ fontSize:10, color:"#9da3ae", paddingTop:4 }} iconSize={10} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+            <div style={{ fontSize:10, color:"#565c66", marginTop:4, lineHeight:1.45 }}>
+              User UCB projected at constant real-terms policy persistence (delta scales with nominal GDP).
+              Debt-interest cascade reduces PDI in years 2+ when cumulative improvement is positive.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── PHASE 6 PANELS: Locked / Net Worth / State Payments ─────────────── */}
+      <div className="panel-pad" style={{ background:"#282c34", borderBottom:"1px solid #4a4f59", padding:"14px 20px 18px" }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:10, flexWrap:"wrap", gap:6 }}>
+          <div style={{ fontSize:11, color:"#9bbef7", fontWeight:700, letterSpacing:"0.05em" }}>
+            STRUCTURAL CONTEXT — WHAT IS LOCKED, WHAT IS MOVEABLE
+          </div>
+          <div style={{ fontSize:10, color:"#7c828c" }}>
+            BP1 Statements 6, 9 &amp; 10 · Indicative shares · Decomposition of total payments
+          </div>
+        </div>
+
+        <div className="forward-grid" style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:14, alignItems:"start" }}>
+
+          {/* Locked vs Discretionary */}
+          <div style={{ background:"#2d3139", border:"1px solid #4a4f59", borderRadius:5, padding:"10px 12px" }}>
+            <div style={{ fontSize:10, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:8 }}>
+              Locked vs Discretionary Spending
+            </div>
+            {[
+              { label:"Public Debt Interest",       v: 31.9, locked:true,  note:"Compounds at 8.77% CAGR; cannot be cut" },
+              { label:"Age Pension (demographic)",  v: 68.7, locked:true,  note:"Indexed under Social Security Act 1991" },
+              { label:"NDIS (post-reform floor)",   v: 56.1, locked:true,  note:"Reform trajectory; further cuts politically constrained" },
+              { label:"Hospitals (NHRA Addendum)",  v: 37.4, locked:true,  note:"Floor under NHRA Addendum 2025-2030" },
+              { label:"Defence (NDS commitments)",  v: 62.5, locked:true,  note:"AUKUS + IIP commitments; section 51(vi)" },
+              { label:"Medicare Benefits (MBS)",    v: 47.2, locked:true,  note:"Statutory entitlement" },
+              { label:"PBS",                         v: 24.6, locked:true,  note:"National Health Act 1953 (Cth)" },
+              { label:"Aged Care",                   v: 43.8, locked:true,  note:"Aged Care Act 2024 (Cth)" },
+              { label:"Discretionary (residual)",    v: 457.4, locked:false, note:"Subject to annual appropriations &amp; cabinet decision" },
+            ].map(item => {
+              const pct = item.v / BASELINE_PAYMENTS * 100;
+              return (
+                <div key={item.label} style={{ marginBottom:7 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:10, color:"#c0c4cd", marginBottom:2 }}>
+                    <span style={{ color: item.locked ? "#d88c8c" : "#7cb87a" }}>
+                      {item.locked ? "● " : "○ "}{item.label}
+                    </span>
+                    <span style={{ color:"#9bbef7", fontWeight:600 }}>${item.v.toFixed(1)}B</span>
+                  </div>
+                  <div style={{ height:3, background:"#4a4f59", borderRadius:2, overflow:"hidden" }}>
+                    <div style={{ width:`${Math.min(100, pct * 3)}%`, height:"100%",
+                      background: item.locked ? "#d88c8c" : "#7cb87a", opacity:0.7 }} />
+                  </div>
+                  <div style={{ fontSize:9, color:"#565c66", marginTop:1 }}>{item.note}</div>
+                </div>
+              );
+            })}
+            <div style={{ marginTop:8, paddingTop:6, borderTop:"1px solid #4a4f59", fontSize:10, color:"#9da3ae", lineHeight:1.5 }}>
+              <strong style={{ color:"#d9b16c" }}>≈ 45% of total payments are locked</strong> by statute,
+              demographic obligation, or treaty commitment. Genuine annual discretion sits in the residual.
+            </div>
+          </div>
+
+          {/* Net Worth Tracker */}
+          <div style={{ background:"#2d3139", border:"1px solid #4a4f59", borderRadius:5, padding:"10px 12px" }}>
+            <div style={{ fontSize:10, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:8 }}>
+              Commonwealth Net Worth Position
+            </div>
+            <div style={{ marginBottom:10 }}>
+              <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase" }}>2026-27 Net Worth</div>
+              <div style={{ fontSize:24, fontWeight:700, color:"#d88c8c", lineHeight:1.1 }}>−$646.9B</div>
+              <div style={{ fontSize:10, color:"#565c66" }}>−20.9% of GDP · BP1 Statement 10</div>
+            </div>
+            <div style={{ fontSize:10, color:"#c0c4cd", lineHeight:1.5 }}>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr auto", gap:4, marginBottom:4 }}>
+                <span>Total assets</span><span style={{ color:"#9bbef7" }}>$980.5B</span>
+                <span style={{ paddingLeft:8, color:"#6e7480" }}>Cash &amp; deposits</span><span style={{ color:"#9da3ae" }}>$63.7B</span>
+                <span style={{ paddingLeft:8, color:"#6e7480" }}>Investments &amp; advances</span><span style={{ color:"#9da3ae" }}>$359.7B</span>
+                <span style={{ paddingLeft:8, color:"#6e7480" }}>Equity investments</span><span style={{ color:"#9da3ae" }}>$202.0B</span>
+                <span style={{ paddingLeft:8, color:"#6e7480" }}>Other receivables</span><span style={{ color:"#9da3ae" }}>$106.5B</span>
+                <span style={{ paddingLeft:8, color:"#6e7480" }}>Non-financial assets</span><span style={{ color:"#9da3ae" }}>$248.7B</span>
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr auto", gap:4, marginTop:6 }}>
+                <span>Total liabilities</span><span style={{ color:"#d88c8c" }}>$1,627.4B</span>
+                <span style={{ paddingLeft:8, color:"#6e7480" }}>Govt securities (gross debt)</span><span style={{ color:"#9da3ae" }}>$987.6B</span>
+                <span style={{ paddingLeft:8, color:"#6e7480" }}>Superannuation liability</span><span style={{ color:"#9da3ae" }}>$326.9B</span>
+                <span style={{ paddingLeft:8, color:"#6e7480" }}>Other interest-bearing</span><span style={{ color:"#9da3ae" }}>$52.3B</span>
+                <span style={{ paddingLeft:8, color:"#6e7480" }}>Provisions &amp; payables</span><span style={{ color:"#9da3ae" }}>$260.5B</span>
+              </div>
+            </div>
+            <div style={{ marginTop:10, paddingTop:6, borderTop:"1px solid #4a4f59", fontSize:10, color:"#9da3ae", lineHeight:1.5 }}>
+              Net worth deteriorating by approximately <strong style={{ color:"#d9b16c" }}>$35–45B/yr</strong>
+              through the forward estimates. Drift is dominated by gross debt growing faster than
+              the asset base; superannuation liability adds approximately $8B/yr unfunded.
+            </div>
+          </div>
+
+          {/* State Payments Separation */}
+          <div style={{ background:"#2d3139", border:"1px solid #4a4f59", borderRadius:5, padding:"10px 12px" }}>
+            <div style={{ fontSize:10, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:8 }}>
+              Payments to States &amp; Territories
+            </div>
+            <div style={{ marginBottom:10 }}>
+              <div style={{ fontSize:9, color:"#7c828c", textTransform:"uppercase" }}>Total Cth → States 2026-27</div>
+              <div style={{ fontSize:24, fontWeight:700, color:"#d9b16c", lineHeight:1.1 }}>$207.8B</div>
+              <div style={{ fontSize:10, color:"#565c66" }}>25.0% of total Cth payments · BP3 Table 1.1</div>
+            </div>
+            {[
+              { label:"GST &amp; general revenue assistance", v:110.3, color:"#d9b16c" },
+              { label:"National Health Reform (hospitals)",    v: 37.4, color:"#9bbef7" },
+              { label:"Better &amp; Fairer Schools",            v: 34.4, color:"#9bbef7" },
+              { label:"National Partnership payments",          v: 20.2, color:"#9bbef7" },
+              { label:"National Skills Agreement",              v:  2.6, color:"#9bbef7" },
+              { label:"Social Housing &amp; Homelessness",      v:  1.9, color:"#9bbef7" },
+              { label:"Access to Justice Partnership",          v:  0.8, color:"#9bbef7" },
+              { label:"Foundational Supports (new)",            v:  0.3, color:"#7cb87a" },
+            ].map(item => (
+              <div key={item.label} style={{ marginBottom:6 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", fontSize:10, color:"#c0c4cd", marginBottom:2 }}>
+                  <span dangerouslySetInnerHTML={{ __html: item.label }} />
+                  <span style={{ color:item.color, fontWeight:600 }}>${item.v.toFixed(1)}B</span>
+                </div>
+                <div style={{ height:3, background:"#4a4f59", borderRadius:2, overflow:"hidden" }}>
+                  <div style={{ width:`${item.v / 110.3 * 100}%`, height:"100%", background:item.color, opacity:0.7 }} />
+                </div>
+              </div>
+            ))}
+            <div style={{ marginTop:8, paddingTop:6, borderTop:"1px solid #4a4f59", fontSize:10, color:"#9da3ae", lineHeight:1.5 }}>
+              All payments to states under <strong style={{ color:"#9bbef7" }}>Federal Financial Relations
+              Act 2009 (Cth)</strong> Schedules A &amp; B. GST entitlement set by Commonwealth Grants Commission
+              equalisation methodology under the Commonwealth Grants Commission Act 1973 (Cth).
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── SCORECARD PANEL ── */}
+      {(() => {
+        const sc = scorecard;
+        if (!sc) return null;
+        const gradeColor = (s) => s >= 70 ? "#7cb87a" : s >= 50 ? "#d9b16c" : s >= 30 ? "#d88c8c" : "#b05050";
+        const gradeLabel = (s) => sc.letterGrade(s);
+        return (
+          <div style={{ margin:"0 0 18px 0", background:"#23262e", border:"1px solid #4a4f59", borderRadius:8, overflow:"hidden" }}>
+            {/* Header */}
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
+              padding:"12px 16px", background:"#1e2128", borderBottom:"1px solid #4a4f59" }}>
+              <div>
+                <span style={{ fontSize:13, fontWeight:700, color:"#c0c4cd", letterSpacing:"0.03em" }}>
+                  BUDGET SCORECARD
+                </span>
+                <span style={{ fontSize:10, color:"#7c828c", marginLeft:10 }}>
+                  Heuristic assessment — 6 policy dimensions
+                </span>
+              </div>
+              <div style={{ display:"flex", alignItems:"baseline", gap:10 }}>
+                <span style={{ fontSize:11, color:"#7c828c" }}>Overall</span>
+                <span style={{ fontSize:32, fontWeight:900, color:gradeColor(sc.overall), lineHeight:1 }}>
+                  {sc.grade}
+                </span>
+                <span style={{ fontSize:14, color:gradeColor(sc.overall), fontWeight:700 }}>
+                  {sc.overall}/100
+                </span>
+              </div>
+            </div>
+            {/* Dimension grid */}
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:0 }}>
+              {sc.dimensions.map((dim, i) => {
+                const col = gradeColor(dim.score);
+                const barW = `${dim.score}%`;
+                return (
+                  <div key={dim.key} style={{
+                    padding:"10px 14px",
+                    borderRight: i % 3 !== 2 ? "1px solid #3a3e47" : "none",
+                    borderBottom: i < 3 ? "1px solid #3a3e47" : "none",
+                  }}>
+                    <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:5 }}>
+                      <span style={{ fontSize:10, color:"#8a909a", letterSpacing:"0.03em" }}>{dim.label.toUpperCase()}</span>
+                      <span style={{ fontSize:18, fontWeight:900, color:col, lineHeight:1 }}>
+                        {gradeLabel(dim.score)}
+                      </span>
+                    </div>
+                    {/* Score bar */}
+                    <div style={{ height:5, background:"#3a3e47", borderRadius:3, marginBottom:5, overflow:"hidden" }}>
+                      <div style={{ height:"100%", width:barW, background:col, borderRadius:3,
+                        transition:"width 0.3s ease" }} />
+                    </div>
+                    <div style={{ fontSize:9.5, color:"#6e7480", lineHeight:1.4 }}>{dim.desc}</div>
+                  </div>
+                );
+              })}
+            </div>
+            {/* Fiscal summary row */}
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:0,
+              borderTop:"1px solid #3a3e47", background:"#1e2128" }}>
+              {[
+                { l:"Balance", v:`${sc.bal >= 0 ? "+" : ""}${sc.bal.toFixed(1)}B`, c: sc.bal >= 0 ? "#7cb87a" : "#d88c8c" },
+                { l:"% GDP",   v:`${sc.balPctGdp.toFixed(2)}%`,                    c: sc.bal >= 0 ? "#7cb87a" : "#d88c8c" },
+                { l:"Revenue", v:`$${sc.totalRev.toFixed(0)}B (${sc.revPctGdp.toFixed(1)}% GDP)`, c:"#9bbef7" },
+                { l:"Spending",v:`$${sc.totalSpend.toFixed(0)}B (${sc.spPctGdp.toFixed(1)}% GDP)`,c:"#d9b16c" },
+              ].map((item, i) => (
+                <div key={i} style={{ padding:"7px 14px", borderRight: i < 3 ? "1px solid #3a3e47" : "none" }}>
+                  <div style={{ fontSize:9, color:"#7c828c", marginBottom:2 }}>{item.l}</div>
+                  <div style={{ fontSize:12, fontWeight:700, color:item.c }}>{item.v}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── TWO-COLUMN LAYOUT ── */}
+      <div className="two-col" style={{ display:"grid", gridTemplateColumns:"1fr 1fr" }}>
+
+        {/* ══ REVENUE COLUMN ══ */}
+        <div className="col col-divider" style={S.col}>
+          <div style={{ fontSize:10, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.1em",
+            marginBottom:10, paddingBottom:6, borderBottom:"1px solid #4a4f59" }}>
+            Revenue Levers — 17 Categories
+          </div>
+
+          {/* ─ INCOME TAX ─ */}
+          <Sec title="1.  Progressive Income Tax" sub="~$382B/yr" init={true} delta={dIncomeTax}>
+            <div style={{ fontSize:10, color:"#6e7480", marginBottom:10, lineHeight:1.5 }}>
+              Default brackets reflect Stage 4 (in effect 1 July 2026 under amendments to
+              the Income Tax Rates Act 1986 (Cth)). Edit any rate; add a threshold to split a bracket.
+              Pools calibrated to ATO 2026-27 distribution data.
+            </div>
+
+            {/* Bracket cards */}
+            <div className="bracket-grid" style={{
+              display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(200px,1fr))",
+              gap: 8, marginBottom: 10
+            }}>
+              {sorted.map((b, i) => (
+                <BracketCard
+                  key={b.id}
+                  bracket={b}
+                  index={i}
+                  onRateChange={updateRate}
+                  onRemove={removeBracket}
+                />
+              ))}
+            </div>
+
+            {/* Add bracket / Reset */}
+            <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap", marginBottom:10 }}>
+              {adding ? (
+                <>
+                  <span style={{ fontSize:11, color:"#8a909a" }}>New threshold: $</span>
+                  <input className="numinput" type="text" value={thresh} placeholder="e.g. 80000"
+                    style={{ width:90 }}
+                    onChange={e => setThresh(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && addBracket()} />
+                  <button onClick={addBracket}  style={S.btn("#3d4a5a","#9bbef7")}>Add</button>
+                  <button onClick={() => setAdding(false)} style={S.btn("#4a4f59","#6e7480")}>Cancel</button>
+                </>
+              ) : (
+                <>
+                  <button onClick={() => setAdding(true)}
+                    style={S.btn("#3d4a5a","#9bbef7")}>+ Add bracket</button>
+                  <button onClick={() => { setBrackets(DEFAULT_BRACKETS); setNextId(10); }}
+                    style={S.btn("#4a4f59","#6e7480")}>↺ Reset brackets</button>
+                </>
+              )}
+            </div>
+
+            {/* Income tax summary */}
+            <div style={{ ...S.note, marginBottom:12 }}>
+              Income tax change from brackets:&nbsp;
+              <span style={{ color: itDelta >= 0 ? "#7cb87a":"#d88c8c", fontWeight:700 }}>
+                {fmt(itDelta, true)}
+              </span>
+            </div>
+
+            {/* Effective tax calculator */}
+            <div style={{ background:"#2d3139", border:"1px solid #4a4f59", borderRadius:5, padding:10, marginBottom:14 }}>
+              <div style={{ fontSize:10, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.08em", marginBottom:6 }}>
+                Effective Tax Calculator
+              </div>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
+                <span style={{ fontSize:11, color:"#8a909a" }}>Taxable income: $</span>
+                <input className="numinput" type="number" value={calcInc} min={0} max={5000000} step={1000}
+                  style={{ width:90 }}
+                  onChange={e => setCalcInc(parseFloat(e.target.value)||0)} />
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:6 }}>
+                {[
+                  { l:"Tax payable",     v:`$${taxAtCalcInc.toLocaleString(undefined,{maximumFractionDigits:0})}` },
+                  { l:"Effective rate",  v:`${effRate.toFixed(1)}%` },
+                  { l:"Marginal rate",   v:`${margRate}%` },
+                ].map(item => (
+                  <div key={item.l} style={{ background:"#282c34", borderRadius:3, padding:"5px 8px" }}>
+                    <div style={{ fontSize:9, color:"#7c828c" }}>{item.l}</div>
+                    <div style={{ fontSize:14, fontWeight:700, color:"#9bbef7" }}>{item.v}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <Slider label="Medicare levy rate" value={medicare} min={0} max={5} step={0.5} onChange={setMedicare}
+              display={v => `${v}%`}
+              desc="Currently 2% under the Medicare Levy Act 1986 (Cth). Revenue ~$30B/yr on $1,500B individual taxable income base. Each 1pp ≈ $15B." />
+          </Sec>
+
+          <Sec title="2.  Company Tax (progressive brackets)" sub="~$154B/yr" delta={dCompany}>
+            <div style={{ fontSize:10, color:"#6e7480", marginBottom:10, lineHeight:1.5 }}>
+              Current Australian system is binary: 25% (base rate entity, turnover &lt;$50M and ≤80% passive income)
+              or 30% (all others), under the Income Tax Rates Act 1986 (Cth). This is a HYPOTHETICAL progressive
+              structure distributing aggregate corporate taxable profit (~$550B) across six bands by company profit.
+              Defaults (25/25/25/25/30/30) reproduce the ~$154B 2026-27 baseline.
+            </div>
+
+            {/* Company bracket cards */}
+            <div className="bracket-grid" style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))", gap:8, marginBottom:10 }}>
+              {[...companyBrackets].sort((a, b) => a.min - b.min).map((b, i, arr) => {
+                const pool = COMPANY_PROFIT_POOLS.find(p => p.min === b.min && (p.max === b.max || (p.max === Infinity && b.max === Infinity)));
+                const poolB = pool?.poolB || 0;
+                const taxYield = poolB * (b.rate / 100);
+                const isMin = b.min === 0;
+                const isMax = b.max === Infinity;
+                return (
+                  <div key={b.id} style={{
+                    background: "#2d3139", border: "1px solid #4a4f59", borderRadius: 4, padding: "8px 10px"
+                  }}>
+                    <div style={{ fontSize: 10, color: "#7c828c", letterSpacing: "0.05em", marginBottom: 3 }}>
+                      {isMin ? "Up to" : "$" + b.min.toLocaleString()}
+                      {!isMin && !isMax && " – "}
+                      {isMax ? "+" : isMin ? " $" + b.max.toLocaleString() : "$" + b.max.toLocaleString()}
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <input className="numinput" type="number" value={b.rate} min={0} max={90} step={0.5}
+                        style={{ width: 55, fontSize: 16, fontWeight: 700 }}
+                        onChange={e => updateCompanyRate(b.id, e.target.value)} />
+                      <span style={{ fontSize: 14, color: "#9bbef7", fontWeight: 700 }}>%</span>
+                      {!isMin && (
+                        <button onClick={() => removeCompanyBracket(b.id)}
+                          style={{ marginLeft: "auto", background: "#4a3030", color: "#d88c8c", border: "none",
+                            borderRadius: 3, padding: "2px 6px", fontSize: 10, cursor: "pointer", fontFamily: "inherit" }}>
+                          ✕
+                        </button>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 9, color: "#565c66", marginTop: 4 }}>
+                      Pool: ${poolB}B → ${taxYield.toFixed(1)}B yield
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Add company bracket UI */}
+            <div style={{ display:"flex", gap:8, alignItems:"center", marginBottom:10, flexWrap:"wrap" }}>
+              {addingCompany ? (
+                <>
+                  <input className="numinput" type="text" value={companyThresh} placeholder="e.g. 1000000"
+                    onChange={e => setCompanyThresh(e.target.value)} style={{ width: 130 }}
+                    onKeyDown={e => e.key === "Enter" && addCompanyBracket()} />
+                  <button onClick={addCompanyBracket} style={S.btn("#3d4a5a", "#9bbef7")}>Add</button>
+                  <button onClick={() => { setAddingCompany(false); setCompanyThresh(""); }}
+                    style={S.btn("#2d3139", "#7c828c")}>Cancel</button>
+                </>
+              ) : (
+                <>
+                  <button onClick={() => setAddingCompany(true)} style={S.btn("#3d4a5a", "#9bbef7")}>
+                    + Add bracket threshold
+                  </button>
+                  <button onClick={() => { setCompanyBrackets(DEFAULT_COMPANY_BRACKETS); setNextCompanyId(7); }}
+                    style={S.btn("#4a4f59", "#6e7480")}>
+                    ↺ Reset to current law
+                  </button>
+                </>
+              )}
+            </div>
+
+            <div style={{ ...S.note, marginTop:10, lineHeight:1.5 }}>
+              <strong style={{ color:"#9bbef7" }}>Total company tax at current settings:</strong>{" "}
+              <span style={{ color:"#9bbef7", fontWeight:700 }}>${calcCompanyTax(companyBrackets).toFixed(1)}B</span>{" "}
+              vs $154.0B baseline.
+              <br />Note: pools are simplified aggregates; ATO Corporate Tax Transparency reports show roughly
+              50% of company tax is paid by the top 100 entities.
+            </div>
+
+            <div style={{ marginTop:14, paddingTop:10, borderTop:"1px solid #3a3e47" }}>
+              <div style={{ fontSize:10, color:"#d9b16c", fontWeight:600, marginBottom:8 }}>
+                2026-27 Budget measures — small business concessions
+              </div>
+              <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+                <input type="checkbox" id="losscarry" checked={lossCarry} onChange={e => setLossCarry(e.target.checked)} style={{ marginTop:2 }} />
+                <label htmlFor="losscarry" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                  Small company loss carry-back <BudgetBadge />&nbsp;<span style={{ color:"#d88c8c" }}>(−$0.5B/yr cost)</span>
+                  <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                    Allows companies with turnover &lt;$50M to offset current losses against prior-year tax paid.
+                    ITAA 1997 Subdivision 160 amendments. Uncheck to remove.
+                  </span>
+                </label>
+              </div>
+              <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:6 }}>
+                <input type="checkbox" id="iawo" checked={iawo} onChange={e => setIawo(e.target.checked)} style={{ marginTop:2 }} />
+                <label htmlFor="iawo" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                  $20,000 instant asset write-off (permanent) <BudgetBadge />&nbsp;
+                  <span style={{ color:"#8a909a" }}>(currently legislated — uncheck to abolish = +$0.3B/yr)</span>
+                  <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                    Made permanent in 2026-27 Budget for small businesses (turnover &lt;$10M). Treasury Laws Amendment
+                    (Tax Incentives for the Digital Economy) 2021 (Cth) base; extended to current threshold.
+                  </span>
+                </label>
+              </div>
+            </div>
+          </Sec>
+
+          <Sec title="3.  GST (passes through to states)" sub="~$104B flow" delta={dGst}>
+            <div style={{ background:"#363a43", border:"1px solid #7c828c", borderRadius:4, padding:"8px 10px", marginBottom:12, fontSize:10, color:"#c0c4cd", lineHeight:1.55 }}>
+              <strong style={{ color:"#9bbef7" }}>How GST works:</strong> The Commonwealth collects GST under
+              the A New Tax System (Goods and Services Tax) Act 1999 (Cth) and passes the entire entitlement
+              to states under the Federal Financial Relations Act 2009 (Cth) and the Intergovernmental Agreement
+              on Federal Financial Relations. Changes to rate or base raise both Cth receipts AND Cth payments to
+              states by the same amount — net Cth impact = $0. Only the retention share lever creates net Cth revenue.
+            </div>
+            <Slider label="GST rate" value={gstRate} min={0} max={20} step={1} onChange={setGstRate}
+              display={v => `${v}%`}
+              desc="Currently 10%. Each 1pp raises $10.4B in receipts AND $10.4B in state payments — net Cth $0 at default retention."
+              note="Rate change alone is fiscally neutral for the Commonwealth — it benefits the states." />
+            {/* Itemised GST exemption removal — currently GST-free or input-taxed categories */}
+            <div style={{ background:"#2d3139", border:"1px solid #4a4f59", borderRadius:5, padding:"10px 12px", marginBottom:12 }}>
+              <div style={{ fontSize:11, color:"#9bbef7", fontWeight:600, marginBottom:8, letterSpacing:"0.03em" }}>
+                Tax currently GST-free / input-taxed categories
+              </div>
+              <div style={{ fontSize:10, color:"#6e7480", marginBottom:10, lineHeight:1.5 }}>
+                Each tick subjects that category to 10% GST. All collections flow to states under
+                the FFR Act 2009 (Cth) unless the retention lever below is engaged. Amounts shown are
+                additional gross GST collected at 10% rate.
+              </div>
+              {[
+                { id:"gstFood",       state:gstExFood,       setter:setGstExFood,       label:"Fresh basic food",                amount:"+$8.0B",  cite:"s.38-2 GSTA 1999 (raw fruit, veg, meat, dairy, bread)" },
+                { id:"gstHealth",     state:gstExHealth,     setter:setGstExHealth,     label:"Health services (medical, dental, allied)", amount:"+$6.0B", cite:"Subdivision 38-B GSTA 1999" },
+                { id:"gstEducation",  state:gstExEducation,  setter:setGstExEducation,  label:"Education services (private)",     amount:"+$3.0B",  cite:"Subdivision 38-C GSTA 1999 (private school fees, vocational, tertiary)" },
+                { id:"gstChildcare",  state:gstExChildcare,  setter:setGstExChildcare,  label:"Childcare services",               amount:"+$1.0B",  cite:"Subdivision 38-D GSTA 1999" },
+                { id:"gstReligious",  state:gstExReligious,  setter:setGstExReligious,  label:"Religious services",               amount:"+$0.3B",  cite:"s.38-220 GSTA 1999 (sacraments, services by religious institutions)" },
+                { id:"gstCharity",    state:gstExCharity,    setter:setGstExCharity,    label:"Non-commercial charity activities",amount:"+$0.4B",  cite:"Subdivision 38-G GSTA 1999 (registered charities, gift deductible recipients)" },
+                { id:"gstRentRes",    state:gstExRentRes,    setter:setGstExRentRes,    label:"Residential rent",                 amount:"+$4.0B",  cite:"Division 40 GSTA 1999 (input taxed; ~$40B residential rent market)" },
+                { id:"gstFinancial",  state:gstExFinancial,  setter:setGstExFinancial,  label:"Financial supplies",               amount:"+$3.0B",  cite:"Division 40 GSTA 1999 (input taxed; bank fees, insurance, securities)" },
+                { id:"gstWaterSewer", state:gstExWaterSewer, setter:setGstExWaterSewer, label:"Water, sewerage, drainage",        amount:"+$0.5B",  cite:"s.38-285 GSTA 1999" },
+                { id:"gstPrecMetals", state:gstExPrecMetals, setter:setGstExPrecMetals, label:"Precious metals (gold, silver, platinum)", amount:"+$0.05B", cite:"Subdivision 38-L GSTA 1999" },
+              ].map(item => (
+                <div key={item.id} style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:6 }}>
+                  <input type="checkbox" id={item.id} checked={item.state}
+                    onChange={e => item.setter(e.target.checked)} style={{ marginTop:2 }} />
+                  <label htmlFor={item.id} style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.4, flex:1 }}>
+                    {item.label}&nbsp;<span style={{ color:"#d9b16c", fontWeight:600 }}>({item.amount})</span>
+                    <span style={{ display:"block", color:"#6e7480", fontSize:9.5, marginTop:1 }}>{item.cite}</span>
+                  </label>
+                </div>
+              ))}
+              <div style={{ marginTop:8, paddingTop:8, borderTop:"1px solid #3a3e47", fontSize:10, color:"#8a909a" }}>
+                Note: removing GST-free / input-taxed status requires amendments to the GSTA 1999, which
+                are subject to the unanimous consent of states and territories under the Intergovernmental
+                Agreement on Federal Financial Relations. International transport and exports remain
+                zero-rated for trade competitiveness reasons (not listed).
+              </div>
+            </div>
+
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:14 }}>
+              <input type="checkbox" id="gstb" checked={gstBase} onChange={e => setGstBase(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="gstb" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Legacy bulk-expand toggle (food + health + education combined)&nbsp;<span style={{ color:"#d9b16c" }}>(+$20B flow to states)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  Kept for back-compat with older scenarios. Prefer the itemised checkboxes above.
+                </span>
+              </label>
+            </div>
+            <Slider label="Cth GST retention share (new lever)" value={gstRetain} min={0} max={25} step={1} onChange={setGstRetain}
+              display={v => v === 0 ? "0% — current law" : `${v}% retained by Cth`}
+              desc="Hypothetical: Cth retains a share of GST instead of passing all to states. Each 1pp ≈ +$1.04B Cth (and −$1.04B states)."
+              note="Constitutional pathway: requires amendment to Federal Financial Relations Act 2009 (Cth) and renegotiation of the Intergovernmental Agreement on Federal Financial Relations. Highly politically contested." />
+          </Sec>
+
+          <Sec title="4.  Superannuation Taxes" sub="~$32B/yr" delta={dSuper}>
+            <Slider label="Earnings tax — accumulation phase" value={superEarn} min={0} max={35} step={1} onChange={setSuperEarn}
+              display={v => `${v}%`}
+              desc="Currently 15% on super fund earnings (Superannuation Industry (Supervision) Act 1993 (Cth)). Each 1pp ≈ $2.1B." />
+            <Slider label="Concessional contributions tax" value={superConc} min={0} max={35} step={1} onChange={setSuperConc}
+              display={v => `${v}%`}
+              desc="Currently 15% on employer & salary-sacrifice contributions. Each 1pp ≈ $1.8B." />
+            <Slider label="High-balance surcharge (Div 296, balances >$3M)" value={superHB} min={15} max={45} step={1} onChange={setSuperHB}
+              display={v => v <= 15 ? "No surcharge" : `${v}%`}
+              desc="Division 296 now in effect (additional 15pp on earnings attributable to balances above $3M). ~80,000 affected accounts."
+              note="15% = pre-reform. 30% = current law (Treasury Laws Amendment (Better Targeted Superannuation Concessions) Act 2025 (Cth)). Each 1pp above 30% ≈ $400M." />
+          </Sec>
+
+          <Sec title="5.  Capital Gains Tax" sub="~$34B/yr" delta={dCgt}>
+            <Slider label="CGT discount — assets held >12 months" value={cgtDisc} min={0} max={75} step={5} onChange={setCgtDisc}
+              display={v => `${v}%`}
+              desc="Currently 50% under Income Tax Assessment Act 1997 (Cth) Division 115. Each 10pp reduction ≈ $4.5B." />
+            <Slider label="Primary residence — % of gain taxed" value={primRes} min={0} max={100} step={5} onChange={setPrimRes}
+              display={v => `${v}%`}
+              desc="Currently fully exempt (main residence exemption, ITAA 1997 Subdivision 118-B). Full inclusion ≈ +$22B. Highly sensitive politically; large behavioural effects expected." />
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10, marginTop:6 }}>
+              <input type="checkbox" id="cgtmin" checked={cgtMinTax} onChange={e => setCgtMinTax(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="cgtmin" style={{ fontSize:11, color: cgtMinTaxEffect < 0.05 ? "#6e7480" : "#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                CGT indexation + 30% effective minimum
+                <BudgetBadge superseded={cgtMinTaxEffect < 0.05} />
+                &nbsp;<span style={{ color:"#7cb87a" }}>(+${cgtMinTaxEffect.toFixed(2)}B/yr — interaction-adjusted)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10, marginTop:2 }}>
+                  Effective 1 July 2027. Replaces 50% discount with indexation method floored at 30% effective rate
+                  (ITAA 1997 Division 115 amendments). Revenue diminishes as CGT discount slider is reduced — at
+                  cgtDisc=0% this measure adds nothing because all gains are already fully taxed at marginal rates.
+                  {cgtMinTaxEffect < 0.05 && <strong style={{ color:"#d9b16c", display:"block", marginTop:3 }}>
+                    ⚠ Substantially superseded by current CGT discount setting above.
+                  </strong>}
+                </span>
+              </label>
+            </div>
+          </Sec>
+
+          <Sec title="6.  Negative Gearing" sub="~$4B tax expenditure" delta={dNegGear}>
+            <Slider label="Rental-loss deductibility restriction" value={negGear} min={0} max={100} step={10} onChange={setNegGear}
+              display={v => v === 0 ? "Unrestricted (status quo)" : v === 100 ? "Fully ring-fenced (UK model)" : `${v}% restricted`}
+              desc="0% = losses offset all income (status quo). 100% = losses only offset investment income (full ring-fence). Full restriction ≈ +$4B/yr."
+              note="Income Tax Assessment Act 1997 (Cth) Division 35. The 2026-27 Budget restricts to new builds only (see below). The ring-fence slider is a structural hypothetical beyond current policy." />
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10, marginTop:6 }}>
+              <input type="checkbox" id="ngnew" checked={negGearNew} onChange={e => setNegGearNew(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="ngnew" style={{ fontSize:11, color: negGearNewEffect < 0.05 ? "#6e7480" : "#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Restrict negative gearing to new builds only (1 July 2027)
+                <BudgetBadge superseded={negGearNewEffect < 0.05} />
+                &nbsp;<span style={{ color:"#7cb87a" }}>(+${negGearNewEffect.toFixed(2)}B/yr — interaction-adjusted)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10, marginTop:2 }}>
+                  Announced in the 2026-27 Budget. Effective 1 July 2027 (ITAA 1997 Division 35 amendments).
+                  Part of CGT + negative gearing package (+$3.6B/5yr). Only ~12.5% of negatively geared
+                  properties are new builds; estimated direct saving ~$500M/yr at maturity.
+                  {negGear >= 50 && <strong style={{ color:"#d9b16c", display:"block", marginTop:3 }}>
+                    ⚠ Substantially superseded by the ring-fence slider above — the broader restriction
+                    already captures and exceeds the new-builds-only effect.
+                  </strong>}
+                  {negGear > 0 && negGear < 50 && <span style={{ color:"#d9b16c", display:"block", marginTop:3 }}>
+                    Note: partially superseded. Revenue adjusted to avoid double-counting with ring-fence above.
+                  </span>}
+                </span>
+              </label>
+            </div>
+          </Sec>
+
+          <Sec title="7.  Fuel Excise, EV Charges &amp; Heavy Vehicle RUC" sub="~$26B gross / ~$16B net" delta={dFuel}>
+            <Slider label="Fuel excise rate" value={fuel} min={0} max={80} step={0.5} onChange={setFuel}
+              display={v => `${v.toFixed(1)}¢/L`}
+              desc="Indexed half-yearly under Excise Tariff Act 1921 (Cth). At 50.8¢/L the gross is ~$26.4B and net is ~$15.7B (after $10.7B Fuel Tax Credits)."
+              note="FTC payback declines toward zero as rate approaches 20.6¢/L RUC floor. The temporary 32¢/L cut (Apr-Jun 2026) has already ended." />
+            <Slider label="EV road user charge (per-km)" value={evRUC} min={0} max={5} step={0.5} onChange={setEvRUC}
+              display={v => v === 0 ? "No charge" : `${v}¢/km`}
+              desc="Federal per-km charge on EVs. 1¢/km ≈ $400M (~700k BEV+PHEV fleet × ~14,000 km/yr avg)."
+              note="High Court ruled state EV charges unconstitutional in Vanderstock v Victoria [2023] HCA 30 under section 90 (excise is Cth exclusive). A federal charge requires Excise Tariff Act 1921 (Cth) amendments." />
+            <Slider label="EV registration surcharge (annual)" value={evSurcharge} min={0} max={1500} step={50} onChange={setEvSurcharge}
+              display={v => v === 0 ? "No surcharge" : `$${v}/yr`}
+              desc="Flat annual federal surcharge per EV registration. ~700,000 BEV+PHEV vehicles. Each $100/yr ≈ $70M."
+              note="Alternative collection mechanism — billed at registration rather than per-km. Avoids odometer enforcement complexity but is less use-proportional." />
+            <Slider label="Heavy vehicle road user charge (HVRUC)" value={hvRUC} min={0} max={50} step={0.5} onChange={setHvRUC}
+              display={v => `${v.toFixed(1)}¢/L`}
+              desc="Embedded charge on diesel used by heavy vehicles (&gt;4.5t). Currently 20.6¢/L; this is the FTC floor. Each 1¢ above ≈ $200M net excise revenue (heavy vehicles cannot claim FTC above this floor)."
+              note="National Land Transport Act 2014 (Cth) and Fuel Tax Act 2006 (Cth). PAYGO recovery of heavy vehicle road infrastructure costs; recoups arterial road damage attributable to freight." />
+            <Slider label="Electric heavy vehicle HVRUC discount" value={hvEvDiscount} min={0} max={100} step={5} onChange={setHvEvDiscount}
+              display={v => v === 100 ? "100% — fully exempt" : v === 0 ? "0% — full equivalent charge" : `${v}% discount`}
+              desc="EV heavy vehicles consume no diesel and therefore pay no HVRUC. This lever applies a per-km charge equivalent to HVRUC. 100% = fully exempt (current treatment). 0% = full equivalent per-km charge. Currently ~500 EV trucks in the Australian fleet."
+              note="Revenue impact is negligible at current fleet size (each 10pp ≈ $0.5M) but will grow materially as electric heavy vehicle adoption increases. Federal pathway would require new excise/charge legislation since Vanderstock v Victoria [2023] HCA 30 confirms section 90 excise exclusivity." />
+            <Slider label={<span>Passenger Movement Charge <BudgetBadge /></span>}
+              value={pmc} min={0} max={200} step={5} onChange={setPmc}
+              display={v => `$${v}/passenger`}
+              desc="Levied on departure under Passenger Movement Charge Act 1978 (Cth). Currently $70. ~30M international departures/yr. Each $1 ≈ $30M. Baseline is 2026-27 Budget setting." />
+          </Sec>
+
+          <Sec title="8.  Tobacco &amp; Alcohol Excise" sub="~$7B/yr" delta={dTobAlc}>
+            <Slider label="Tobacco excise" value={tobacco} min={0} max={5} step={0.25} onChange={setTobacco}
+              display={v => `$${v.toFixed(2)}/stick`}
+              desc="Currently ~$1.75/stick. Base has structurally collapsed (from $7.8B in 2024-25 to $3.6B in 2026-27) due to illicit tobacco substitution. Each $1/stick ≈ $1B at current base."
+              note="Further rate increases now show diminishing returns. Reform options: enforcement (illicit market), licensing schemes, supply-side regulation." />
+            <Slider label="Alcohol excise" value={alcohol} min={0} max={2} step={0.05} onChange={setAlcohol}
+              display={v => `$${v.toFixed(2)}/std drink`}
+              desc="~$0.70/std drink (285mL beer, 100mL wine, 30mL spirits). Revenue ~$3B/yr. Wine taxed under WET, not excise." />
+          </Sec>
+
+          <Sec title="9.  Resource &amp; Mining Taxes" sub="~$3B/yr" delta={dRes}>
+            <Slider label="PRRT effective rate" value={prrt} min={0} max={80} step={5} onChange={setPrrt}
+              display={v => `${v}%`}
+              desc="Nominal 40% under Petroleum Resource Rent Tax Assessment Act 1987 (Cth). Effective rate lower due to uplift deductions. Each 1pp above 40% ≈ $300M (baseline $1.9B 2026-27)." />
+            <Slider label="Federal mineral resources levy" value={minLevy} min={0} max={30} step={1} onChange={setMinLevy}
+              display={v => v === 0 ? "None" : `${v}%`}
+              desc="No federal levy exists. New profit-based levy on iron ore, coal &amp; LNG. Each 1% ≈ $750M."
+              note="Constitutional pathway: section 51(ii) supports a profits-based tax. The 2010 RSPT and MRRT precedents show political and industry resistance; the MRRT was repealed in 2014." />
+            <Slider label="LNG export levy" value={lngLevy} min={0} max={10} step={0.25} onChange={setLngLevy}
+              display={v => v === 0 ? "No levy" : `$${v.toFixed(2)}/GJ`}
+              desc="Australia exports ~81Mt LNG/yr (~4,300 PJ/yr). Volume-based at export point. $1/GJ ≈ $4.3B."
+              note="Section 90 prohibits state excises but a Cth volume levy at export is permissible. Separate from PRRT." />
+            <Slider label={<span>Domestic gas reservation (% LNG exports) <BudgetBadge /></span>}
+              value={gasReserve} min={0} max={30} step={1} onChange={setGasReserve}
+              display={v => v === 0 ? "None" : `${v}% reserved`}
+              desc="Mandatory diversion of LNG export volumes to domestic supply. Each 1% diverted ≈ $50M net Cth revenue via implied royalty differential (~4,300 PJ/yr export base). Does not reflect full economic cost of disrupted export contracts."
+              note="Constitutional pathway: section 51(i) trade and commerce, section 109 may preempt state gas regulation. Industry contract disruption is the binding political constraint. Analogues: Western Australian domestic gas reservation (15% of LNG production)." />
+          </Sec>
+
+          <Sec title="10. Fringe Benefits Tax (expanded)" sub="~$5.6B/yr" delta={dFbt}>
+            <Slider label="FBT rate" value={fbtRate} min={0} max={60} step={1} onChange={setFbtRate}
+              display={v => `${v}%`}
+              desc="Currently 47% under Fringe Benefits Tax Assessment Act 1986 (Cth). Each 1pp ≈ $120M." />
+            <Slider label="Bulk exemption removal (sweep)" value={fbtExempt} min={0} max={100} step={25} onChange={setFbtExempt}
+              display={v => v === 0 ? "None removed" : v === 100 ? "All removed" : `${v}% removed`}
+              desc="Sweep across small/uncategorised exemptions (laptops, taxi travel, on-site parking, etc.). Full removal ≈ +$2B."
+              note="Applied independently of the category-specific toggles below." />
+            <div style={{ marginTop:6, marginBottom:8, fontSize:10, color:"#9bbef7", letterSpacing:"0.05em", fontWeight:600 }}>
+              Category-specific FBT exemptions (uncheck to remove)
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="fbtEV" checked={fbtEV} onChange={e => setFbtEV(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="fbtEV" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                EV FBT exemption&nbsp;<span style={{ color:"#7cb87a" }}>(removal ≈ +$0.55B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  Treasury Laws Amendment (Electric Car Discount) Act 2022 (Cth). Currently exempts BEV/PHEV under $89,332 (LCT threshold). PHEVs lose access 1 April 2025; BEVs continuing.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="fbtNL" checked={fbtNovated} onChange={e => setFbtNovated(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="fbtNL" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Novated lease salary-sacrifice arrangements&nbsp;<span style={{ color:"#7cb87a" }}>(tightening ≈ +$1.10B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  Statutory formula method (FBTAA 1986 s.9). Used in ~$2.5B/yr of vehicle purchases. Tightening would mean shifting toward operating-cost method only.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="fbtRA" checked={fbtRemote} onChange={e => setFbtRemote(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="fbtRA" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Remote area benefits exemption&nbsp;<span style={{ color:"#7cb87a" }}>(removal ≈ +$0.35B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  FBTAA 1986 ss.58ZC-58ZD. Housing, fuel, holiday transport in eligible remote areas. Removal politically constrained in regional electorates.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="fbtEnt" checked={fbtEntertainment} onChange={e => setFbtEntertainment(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="fbtEnt" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Entertainment / minor benefits exemption&nbsp;<span style={{ color:"#7cb87a" }}>(removal ≈ +$0.30B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  FBTAA 1986 s.58P minor benefits exemption ($300 threshold, infrequent). Covers staff meals, drinks, taxis, gifts, entertainment events. Removal would require tracking and grossing up all such benefits.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="fbtPark" checked={fbtParking} onChange={e => setFbtParking(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="fbtPark" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Car parking benefit small-business exemption&nbsp;<span style={{ color:"#7cb87a" }}>(removal ≈ +$0.50B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  FBTAA 1986 s.58G — exemption for car parking provided by businesses below the small-business aggregated turnover threshold ($50M). Removal would extend FBT to small-business employer-provided parking near commercial parking stations.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="fbtCcWP" checked={fbtChildcareWP} onChange={e => setFbtChildcareWP(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="fbtCcWP" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Work-provided childcare exemption&nbsp;<span style={{ color:"#7cb87a" }}>(removal ≈ +$0.10B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  FBTAA 1986 s.47(2) — childcare facility provided by employer on business premises. Removal would create equity issue against general childcare subsidy structure (CCS via DSS).
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="fbtLap" checked={fbtLaptops} onChange={e => setFbtLaptops(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="fbtLap" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Laptops &amp; portable work devices exemption&nbsp;<span style={{ color:"#7cb87a" }}>(removal ≈ +$0.20B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  FBTAA 1986 s.58X — one portable electronic device per employee per FBT year (laptops, tablets, mobile phones, GPS, calculators). Removal would extend FBT to work-from-home device provision.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="fbtLAFHA" checked={fbtLAFHA} onChange={e => setFbtLAFHA(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="fbtLAFHA" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Living-away-from-home allowance (LAFHA)&nbsp;<span style={{ color:"#7cb87a" }}>(removal ≈ +$0.40B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  FBTAA 1986 Division 7 — accommodation &amp; food costs when working away from usual residence. Reformed in 2012 to limit to 12 months and require Australian residence; removal would fully integrate with income tax.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="fbtReloc" checked={fbtRelocation} onChange={e => setFbtRelocation(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="fbtReloc" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Relocation benefits exemption&nbsp;<span style={{ color:"#7cb87a" }}>(removal ≈ +$0.20B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  FBTAA 1986 Division 13A — removal/relocation costs for employees changing work location. Includes household goods removal, temporary accommodation, and relocation transport.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="fbtPBI" checked={fbtPBI} onChange={e => setFbtPBI(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="fbtPBI" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Public Benevolent Institution &amp; charity FBT cap&nbsp;<span style={{ color:"#7cb87a" }}>(removal ≈ +$0.80B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  FBTAA 1986 s.57A — capped grossed-up exemption ($30,000 for PBIs, $17,000 for hospitals). Major salary-packaging benefit for health, charity, and aged care workers. Removal politically very difficult — substantial wages effect.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="fbtRel" checked={fbtReligious} onChange={e => setFbtReligious(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="fbtRel" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Religious institution housing &amp; benefits exemption&nbsp;<span style={{ color:"#7cb87a" }}>(removal ≈ +$0.05B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  FBTAA 1986 s.57 — exempts benefits provided by religious institutions to ministers of religion (housing, meals, related expenses). Section 116 of the Constitution does not preclude removal but politically sensitive.
+                </span>
+              </label>
+            </div>
+          </Sec>
+
+          <Sec title="11. New Taxes" sub="Currently $0" delta={dNewTax}>
+            <Slider label="Broad-based land value tax" value={lvt} min={0} max={3} step={0.1} onChange={setLvt}
+              display={v => v === 0 ? "None" : `${v.toFixed(1)}%/yr`}
+              desc="Annual rate on unimproved land value (~$6.6T national). 0.5% ≈ $33B; 1% ≈ $66B. Henry Review top recommendation."
+              note="Constitutional pathway: Cth–state cooperation required. Land tax has historically been a state base. A federal LVT under s.51(ii) would need careful design to avoid double taxation; section 114 prevents the Cth taxing state property." />
+            <Slider label="Carbon price" value={carbon} min={0} max={150} step={5} onChange={setCarbon}
+              display={v => v === 0 ? "No price" : `$${v}/t CO₂e`}
+              desc="~430Mt CO₂e/yr. $30/t ≈ $4B; $75/t ≈ $9B; $150/t ≈ $13B. Revenue diminishes as behaviour changes."
+              note="Constitutional pathway: must be drafted as excise to fit section 90 (Cth exclusive). Clean Energy Act 2011 (Cth) precedent — repealed 2014. Coverage and price-discovery mechanism design critical." />
+            <Slider label="Inheritance / estate tax" value={estate} min={0} max={40} step={1} onChange={setEstate}
+              display={v => v === 0 ? "None" : `${v}%`}
+              desc="Abolished federally 1979. ~50,000 estates above $1.5M/yr. At 20% ≈ $7B; at 40% ≈ $14B."
+              note="Constitutional pathway: section 51(ii) permits. Legally simple to reintroduce; politically constrained. Last enacted under Estate Duty Assessment Act 1914 (Cth)." />
+            <Slider label="Annual wealth tax" value={wealth} min={0} max={3} step={0.1} onChange={setWealth}
+              display={v => v === 0 ? "None" : `${v.toFixed(1)}%/yr`}
+              desc="No federal wealth tax exists. At 1% ≈ $6B; at 2% ≈ $10B (avoidance increases above 1%)."
+              note="Constitutional pathway: section 51(ii) permits; section 55 requires single-subject Act. France abolished ISF in 2017; Norway revenue declined after wealth tax tightening. Significant capital flight risk above 1%." />
+            <Slider label="Financial transactions tax" value={finTax} min={0} max={0.5} step={0.05} onChange={setFinTax}
+              display={v => v === 0 ? "None" : `${v.toFixed(2)}%`}
+              desc="Tobin-style levy on ASX trades (~$3T/yr). 0.1% ≈ $1B; 0.5% ≈ $4B after volume reduction." />
+          </Sec>
+
+          <Sec title="12. Other Taxes" sub="~$9B/yr" delta={dOtherTax}>
+            <Slider label="Customs duties &amp; tariffs" value={customs} min={-100} max={200} step={10} onChange={setCustoms}
+              display={v => `${v >= 0 ? "+" : ""}${v}% change`}
+              desc="% change applied to import duty revenue (baseline ~$7.3B/yr under Customs Tariff Act 1995 (Cth)). +100% = double; −100% = abolish." />
+            <Slider label="Luxury car tax rate" value={luxCar} min={0} max={60} step={1} onChange={setLuxCar}
+              display={v => `${v}%`}
+              desc="Currently 33% on vehicles above ~$80k (A New Tax System (Luxury Car Tax) Act 1999 (Cth)). Revenue ~$1B/yr. Each 1pp ≈ $30M." />
+            <Slider label="Wine equalisation tax rate" value={wineEq} min={0} max={50} step={1} onChange={setWineEq}
+              display={v => `${v}%`}
+              desc="Currently 29% on wholesale wine price (A New Tax System (Wine Equalisation Tax) Act 1999 (Cth)). Revenue ~$1B/yr. Each 1pp ≈ $35M." />
+            <Slider label={<span>Working Australian Tax Offset (WATO) <BudgetBadge /></span>}
+              value={wato} min={0} max={500} step={25} onChange={setWato}
+              display={v => v === 0 ? "Off" : `$${v}/yr offset`}
+              desc="Refundable offset for working-age earners. Default Budget setting: $250 (effective 2027-28 income year). Full-year cost ~$1.6B/yr at maturity (BP2 −$6.4B/5yr)."
+              note="Income Tax Assessment Act 1997 (Cth) Division 61 amendments. Phased by income threshold; modelled here as a flat-rate offset. Set to $0 to model abolition; above $250 = more generous than the Budget setting." />
+          </Sec>
+
+          <Sec title="13. Trust Taxation" sub="Discretionary trust reform package" delta={dTrusts}>
+            <div style={{ background:"#363a43", border:"1px solid #7c828c", borderRadius:4, padding:"8px 10px", marginBottom:12, fontSize:10, color:"#c0c4cd", lineHeight:1.55 }}>
+              <strong style={{ color:"#9bbef7" }}>Trust taxation reform:</strong> targets the use of
+              discretionary (family) trusts and bucket-company structures to minimise tax. Australia has
+              an unusually permissive trust regime relative to comparable jurisdictions; reform options are
+              constrained by political resistance from family-business stakeholders. Provisions interact
+              with ITAA 1936 Division 6, Schedule 2F, and family trust election rules.
+            </div>
+            <Slider label="Discretionary trust minimum tax rate" value={trustMinTaxRate} min={0} max={45} step={5} onChange={setTrustMinTaxRate}
+              display={v => v === 0 ? "No minimum (status quo)" : `${v}% floor`}
+              desc="Imposes a minimum effective tax rate on distributions from discretionary trusts, regardless of beneficiary marginal rate. At 30% floor ≈ +$1.2B/yr at maturity (eff. 1 July 2028)."
+              note="ITAA 1936 Division 6 amendments. Targets income streaming to low-rate beneficiaries (children, retirees, lower-income spouses). Equivalent to extending the unearned-income minor rate (Div 6AA) more broadly. Politically difficult — affects ~700,000 discretionary trusts." />
+            <div style={{ marginTop:14, marginBottom:6, fontSize:10, color:"#9bbef7", letterSpacing:"0.05em", fontWeight:600 }}>
+              Anti-avoidance levers
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="trustBC" checked={trustBucketCo} onChange={e => setTrustBucketCo(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="trustBC" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Restrict trust distributions to &ldquo;bucket&rdquo; companies&nbsp;<span style={{ color:"#7cb87a" }}>(+$0.6B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  Bucket companies (a private company that receives trust distributions to cap rate at 30%/25%)
+                  used to defer taxation indefinitely while income is retained. Tightening would limit Div 7A
+                  workarounds and unpaid-present-entitlement schemes.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="trustS99B" checked={trustS99B} onChange={e => setTrustS99B(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="trustS99B" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Tighten ITAA 1936 s.99B foreign trust treatment&nbsp;<span style={{ color:"#7cb87a" }}>(+$0.3B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  Section 99B taxes Australian beneficiaries on distributions from non-resident trusts at
+                  marginal rates. Recent ATO guidance (TD 2024/D2) highlighted compliance gaps. Tighter
+                  reporting and beneficiary identification rules.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="trustLR" checked={trustLossRecoup} onChange={e => setTrustLossRecoup(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="trustLR" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Tighten trust loss recoupment rules&nbsp;<span style={{ color:"#7cb87a" }}>(+$0.4B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  ITAA 1936 Schedule 2F — tests for using prior-year trust losses (control, income injection,
+                  pattern of distributions, 50% stake). Tighten to prevent loss trafficking and shifting
+                  control of loss trusts to income-rich entities.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="trustFTE" checked={trustFTE} onChange={e => setTrustFTE(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="trustFTE" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Tighten Family Trust Election (FTE) restrictions&nbsp;<span style={{ color:"#7cb87a" }}>(+$0.5B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  FTEs (and Interposed Entity Elections) define the &ldquo;family group&rdquo; for the
+                  loss tests above and for franking credit access. Reform options: narrow the family group
+                  definition, restrict the once-only election change provision (4-year window).
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:10 }}>
+              <input type="checkbox" id="trustStr" checked={trustStreaming} onChange={e => setTrustStreaming(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="trustStr" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Tighten capital gain &amp; franked dividend streaming&nbsp;<span style={{ color:"#7cb87a" }}>(+$0.7B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  ITAA 1997 Subdivision 207-B and Subdivision 115-C currently allow trustees to selectively
+                  stream franked dividends to beneficiaries who can use credits, and capital gains to
+                  beneficiaries who can use CGT discounts. Restricting streaming would force proportional
+                  allocation across beneficiaries.
+                </span>
+              </label>
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:14 }}>
+              <input type="checkbox" id="trustCgt" checked={trustCgtDisc} onChange={e => setTrustCgtDisc(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="trustCgt" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Remove CGT 50% discount for trust beneficiaries&nbsp;<span style={{ color:"#7cb87a" }}>(+$1.5B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  Currently trust capital gains retain their CGT-discounted character when distributed to
+                  individual beneficiaries (ITAA 1997 Subdiv 115-C). Removing the discount only for trust
+                  distributions would parallel the existing treatment for companies (which cannot access
+                  the discount). Interaction with the CGT minimum tax in section 13 above.
+                </span>
+              </label>
+            </div>
+            <div style={{ ...S.note, marginTop:6, lineHeight:1.5 }}>
+              <strong style={{ color:"#9bbef7" }}>Combined reform package effect:</strong>{" "}
+              <span style={{ color:"#7cb87a", fontWeight:700 }}>+${dTrusts.toFixed(1)}B/yr</span> at maturity.
+              Treasury Tax Expenditures and Insights Statement estimates the total revenue cost of
+              discretionary trust arrangements at $1.5-3.0B/yr. Reform requires extensive ITAA 1936/97
+              amendments and faces strong opposition from family-business advocacy groups.
+            </div>
+          </Sec>
+
+          <Sec title="14. Environmental &amp; Health Excises" sub="New levies (currently $0)" delta={dEnvHealth}>
+            <div style={{ background:"#363a43", border:"1px solid #7c828c", borderRadius:4, padding:"8px 10px", marginBottom:12, fontSize:10, color:"#c0c4cd", lineHeight:1.55 }}>
+              <strong style={{ color:"#9bbef7" }}>Excises with explicit behavioural objectives:</strong>
+              priced to deter consumption rather than raise pure revenue. Returns diminish as the behaviour
+              shifts, so plotted yields are net of expected demand response. All require section 90 Cth excise
+              drafting; analogue precedents listed per item.
+            </div>
+            <Slider label="Plastic packaging excise" value={plasticExcise} min={0} max={3} step={0.1} onChange={setPlasticExcise}
+              display={v => v === 0 ? "None" : `$${v.toFixed(1)}/kg`}
+              desc="Per-kilogram excise on plastic packaging at point of manufacture or import. ~1.5Mt eligible packaging/yr. $1/kg ≈ $1.5B gross."
+              note="UK Plastic Packaging Tax (April 2022) precedent. Recyclate threshold (≥30% recycled content) exempts compliant packaging." />
+            <Slider label="Single-use plastic items levy" value={singleUsePlastic} min={0} max={1} step={0.05} onChange={setSingleUsePlastic}
+              display={v => v === 0 ? "None" : `$${v.toFixed(2)}/item`}
+              desc="Per-item levy on single-use plastic cutlery, straws, takeaway containers, bags. ~5 billion units/yr base. $0.50/item ≈ $0.25B (high price elasticity)."
+              note="State plastic bag bans have shifted volumes; this is a residual federal levy on remaining single-use plastics. Distinct from packaging excise above." />
+            <Slider label="E-waste levy on consumer electronics" value={eWasteLevy} min={0} max={50} step={1} onChange={setEWasteLevy}
+              display={v => v === 0 ? "None" : `$${v}/device`}
+              desc="Per-device levy at point of sale on consumer electronics (phones, laptops, TVs). ~50M devices/yr base. $10/device ≈ $100M, hypothecated to product stewardship under Recycling and Waste Reduction Act 2020 (Cth)."
+              note="Section 51(ii) tax or section 90 excise drafting. Analogue: EU WEEE Directive, US state-level e-waste fees. Could be fund-flow rather than consolidated revenue." />
+            <Slider label="Tyre levy" value={tyreLevy} min={0} max={10} step={0.5} onChange={setTyreLevy}
+              display={v => v === 0 ? "None" : `$${v.toFixed(1)}/tyre`}
+              desc="Levy on new tyre sales (passenger + commercial). ~25M tyres/yr. $2/tyre ≈ $50M, hypothecated to end-of-life tyre recycling scheme."
+              note="Existing voluntary Tyre Stewardship Australia scheme could be replaced by mandatory levy. ~80% of end-of-life tyres currently exported or stockpiled." />
+            <Slider label="Online gambling / sports betting levy" value={gamblingLevy} min={0} max={25} step={1} onChange={setGamblingLevy}
+              display={v => v === 0 ? "None" : `${v}%`}
+              desc="Federal levy on online wagering turnover. ~$15B online wagering market. 10% ≈ $1.5B; returns diminish above 15% as offshore market share grows."
+              note="Section 51(ii) and (xx). Murphy Inquiry (2023) recommended substantial gambling reform. Distinct from existing state Point of Consumption taxes (currently 10-15% across jurisdictions). Federal excise would need careful design to avoid double taxation." />
+            <Slider label="Vapes / e-cigarette excise" value={vapesExcise} min={0} max={2} step={0.1} onChange={setVapesExcise}
+              display={v => v === 0 ? "None" : `$${v.toFixed(1)}/mL`}
+              desc="Per-mL excise on e-cigarette liquid. ~250M mL/yr base (now legal as TGA-regulated pharmacy products). $1/mL ≈ $0.25B."
+              note="Therapeutic Goods Administration regulates supply via pharmacy-only model from 2024. UK 2026 vapes duty (£2.20/10mL liquid) as direct precedent. Distinct from tobacco excise base." />
+            <Slider label="Alcohol public health additional levy" value={alcoholHealth} min={0} max={50} step={5} onChange={setAlcoholHealth}
+              display={v => v === 0 ? "None" : `+${v}%`}
+              desc="Additional public health levy on top of existing alcohol excise. Each 10pp ≈ +$0.5B (curtailed by behavioural response)."
+              note="Stacks with the alcohol excise slider in section 8. Hypothecated to public health programs. WHO recommends 50%+ effective duty on alcohol." />
+            <Slider label="Air travel emissions levy" value={airEmissions} min={0} max={100} step={5} onChange={setAirEmissions}
+              display={v => v === 0 ? "None" : `$${v}/tCO₂e`}
+              desc="Per-tonne CO₂e levy on departing aviation fuel. ~12 Mt CO₂e domestic + departing international per year. $50/tCO₂e ≈ $0.6B."
+              note="Stacks with carbon price in Section 11. EU ETS aviation precedent; UK Air Passenger Duty differs in being per-passenger. Federal section 90 excise on aviation kerosene." />
+            <Slider label="Battery / lithium recycling levy" value={batteryLevy} min={0} max={15} step={0.5} onChange={setBatteryLevy}
+              display={v => v === 0 ? "None" : `$${v.toFixed(1)}/kWh`}
+              desc="Per-kWh levy on lithium battery sales (EV + grid storage). ~20 GWh/yr installed in Australia. $5/kWh ≈ $0.1B, hypothecated to recycling and end-of-life fund."
+              note="Recycling and Waste Reduction Act 2020 (Cth) framework. Growing base as EV adoption accelerates. Producer responsibility analogue: EU Battery Directive." />
+            <Slider label="Sugar-sweetened beverage / processed food levy" value={sugarLevy} min={0} max={30} step={1} onChange={setSugarLevy}
+              display={v => v === 0 ? "None" : `${v}%`}
+              desc="Levy on sugar-sweetened beverages (~$15B SSB market) plus high-sugar processed foods. 10% ≈ $1.5B; returns diminish above 20%."
+              note="UK SDIL (2018), Mexico (2014), Norway. Public health justification dominant in case law (Cole v Whitfield (1988) framework for &lsquo;regulatory&rsquo; excises)." />
+          </Sec>
+
+          <Sec title="15. Digital Services &amp; Monopoly Levies" sub="New levies (currently $0)" delta={dDigMono}>
+            <div style={{ background:"#363a43", border:"1px solid #7c828c", borderRadius:4, padding:"8px 10px", marginBottom:12, fontSize:10, color:"#c0c4cd", lineHeight:1.55 }}>
+              <strong style={{ color:"#9bbef7" }}>Levies on market concentration:</strong>
+              targeted at addressable bases where international tax arbitrage or market power has eroded
+              the conventional company tax yield.
+            </div>
+            <Slider label="Digital services levy" value={digitalSvc} min={0} max={10} step={0.5} onChange={setDigitalSvc}
+              display={v => v === 0 ? "None" : `${v.toFixed(1)}%`}
+              desc="Levy on Australian-source revenue of major digital platforms (~$50B addressable platform revenue). 3% ≈ $1.5B before treaty credit-back; returns diminish above 5%."
+              note="Constitutional pathway: section 51(ii) taxation. Treaty issues: under OECD Pillar 1 framework, unilateral measures may be challenged. UK DST (2020) and French TSN are precedents. Subject to potential US s.301 retaliatory tariffs." />
+            <Slider label="Excess monopoly profits levy" value={monopolyLevy} min={0} max={30} step={1} onChange={setMonopolyLevy}
+              display={v => v === 0 ? "None" : `${v}%`}
+              desc="Levy on excess profits in concentrated markets (banking, supermarkets, telecoms). ~$30B addressable excess-profit base. 10% ≈ $3B; behavioural restructuring diminishes returns above 10%."
+              note="Constitutional pathway: section 51(ii) and section 51(xx) corporations power. Definitional question: &lsquo;excess profit&rsquo; must be specified by reference to identified concentrated markets and a baseline return measure (e.g., ROIC above industry median)." />
+          </Sec>
+
+          <Sec title="16. Public Ownership / Nationalisation" sub="s.51(xxxi) just-terms acquisition" delta={dNat}>
+            <div style={{ background:"#363a43", border:"1px solid #7c828c", borderRadius:4, padding:"8px 10px", marginBottom:12, fontSize:10, color:"#c0c4cd", lineHeight:1.55 }}>
+              <strong style={{ color:"#9bbef7" }}>Constitutional framework:</strong> section 51(xxxi) of the
+              Constitution empowers the Commonwealth to acquire property &ldquo;on just terms&rdquo; (JT &amp; Co
+              Pty Ltd v Commonwealth (1948); Trade Practices Commission v Tooth (1979)). Acquisition is funded
+              by Commonwealth Government Securities issuance (4.0% yield assumed). The fiscal effect
+              splits across both sides of the budget:
+              <span style={{ display:"block", marginTop:6, color:"#7cb87a" }}>
+                <strong>Revenue side:</strong> annual dividends from the acquired ownership share (gross).
+              </span>
+              <span style={{ display:"block", marginTop:2, color:"#d88c8c" }}>
+                <strong>Spending side:</strong> annual interest on acquisition debt, flowing through PDI.
+              </span>
+              <span style={{ display:"block", marginTop:6, color:"#d9b16c" }}>
+                <strong>Balance sheet:</strong> one-off increase in gross debt equal to acquisition cost,
+                offset by an equivalent increase in Commonwealth-held assets (net financial worth unchanged).
+              </span>
+            </div>
+
+            {/* Acquisition cost summary panel */}
+            {(natLNG > 0 || natIronOre > 0 || natCoalGen > 0 || natBanking > 0) && (() => {
+              const acqLNG     = 80  * natLNG/100;
+              const acqIron    = 200 * natIronOre/100;
+              const acqCoal    = 30  * natCoalGen/100;
+              const acqBank    = 500 * natBanking/100;
+              const acqTotal   = acqLNG + acqIron + acqCoal + acqBank;
+              const divTotal   = (natLNG/100)*10 + (natIronOre/100)*20 + (natCoalGen/100)*0.5 + (natBanking/100)*25;
+              const intTotal   = acqTotal * 0.04;
+              const netAnnual  = divTotal - intTotal;
+              const debtPctGdp = acqTotal / GDP * 100;
+              return (
+                <div style={{ background:"#2d3139", border:"1px solid #4a4f59", borderRadius:5, padding:"10px 12px", marginBottom:14 }}>
+                  <div style={{ fontSize:11, color:"#9bbef7", fontWeight:600, marginBottom:8, letterSpacing:"0.03em" }}>
+                    Acquisition cost summary
+                  </div>
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr auto auto auto auto", gap:"6px 12px", fontSize:10, color:"#c0c4cd", marginBottom:8 }}>
+                    <div style={{ color:"#7c828c", fontSize:9 }}>Industry</div>
+                    <div style={{ color:"#7c828c", fontSize:9, textAlign:"right" }}>Acquisition $B</div>
+                    <div style={{ color:"#7c828c", fontSize:9, textAlign:"right" }}>Dividends $B/yr</div>
+                    <div style={{ color:"#7c828c", fontSize:9, textAlign:"right" }}>Interest $B/yr</div>
+                    <div style={{ color:"#7c828c", fontSize:9, textAlign:"right" }}>Net $B/yr</div>
+                    {natLNG > 0 && (<>
+                      <div>LNG ({natLNG}%)</div>
+                      <div style={{ textAlign:"right", color:"#d9b16c" }}>${acqLNG.toFixed(1)}</div>
+                      <div style={{ textAlign:"right", color:"#7cb87a" }}>+${((natLNG/100)*10).toFixed(2)}</div>
+                      <div style={{ textAlign:"right", color:"#d88c8c" }}>−${(acqLNG*0.04).toFixed(2)}</div>
+                      <div style={{ textAlign:"right", fontWeight:600, color:((natLNG/100)*10 - acqLNG*0.04)>=0?"#7cb87a":"#d88c8c" }}>
+                        {((natLNG/100)*10 - acqLNG*0.04)>=0?"+":""}${((natLNG/100)*10 - acqLNG*0.04).toFixed(2)}
+                      </div>
+                    </>)}
+                    {natIronOre > 0 && (<>
+                      <div>Iron Ore ({natIronOre}%)</div>
+                      <div style={{ textAlign:"right", color:"#d9b16c" }}>${acqIron.toFixed(1)}</div>
+                      <div style={{ textAlign:"right", color:"#7cb87a" }}>+${((natIronOre/100)*20).toFixed(2)}</div>
+                      <div style={{ textAlign:"right", color:"#d88c8c" }}>−${(acqIron*0.04).toFixed(2)}</div>
+                      <div style={{ textAlign:"right", fontWeight:600, color:((natIronOre/100)*20 - acqIron*0.04)>=0?"#7cb87a":"#d88c8c" }}>
+                        {((natIronOre/100)*20 - acqIron*0.04)>=0?"+":""}${((natIronOre/100)*20 - acqIron*0.04).toFixed(2)}
+                      </div>
+                    </>)}
+                    {natCoalGen > 0 && (<>
+                      <div>Coal Gen ({natCoalGen}%)</div>
+                      <div style={{ textAlign:"right", color:"#d9b16c" }}>${acqCoal.toFixed(1)}</div>
+                      <div style={{ textAlign:"right", color:"#7cb87a" }}>+${((natCoalGen/100)*0.5).toFixed(2)}</div>
+                      <div style={{ textAlign:"right", color:"#d88c8c" }}>−${(acqCoal*0.04).toFixed(2)}</div>
+                      <div style={{ textAlign:"right", fontWeight:600, color:((natCoalGen/100)*0.5 - acqCoal*0.04)>=0?"#7cb87a":"#d88c8c" }}>
+                        {((natCoalGen/100)*0.5 - acqCoal*0.04)>=0?"+":""}${((natCoalGen/100)*0.5 - acqCoal*0.04).toFixed(2)}
+                      </div>
+                    </>)}
+                    {natBanking > 0 && (<>
+                      <div>Banking ({natBanking}%)</div>
+                      <div style={{ textAlign:"right", color:"#d9b16c" }}>${acqBank.toFixed(1)}</div>
+                      <div style={{ textAlign:"right", color:"#7cb87a" }}>+${((natBanking/100)*25).toFixed(2)}</div>
+                      <div style={{ textAlign:"right", color:"#d88c8c" }}>−${(acqBank*0.04).toFixed(2)}</div>
+                      <div style={{ textAlign:"right", fontWeight:600, color:((natBanking/100)*25 - acqBank*0.04)>=0?"#7cb87a":"#d88c8c" }}>
+                        {((natBanking/100)*25 - acqBank*0.04)>=0?"+":""}${((natBanking/100)*25 - acqBank*0.04).toFixed(2)}
+                      </div>
+                    </>)}
+                    <div style={{ borderTop:"1px solid #4a4f59", paddingTop:5, fontWeight:700, color:"#9bbef7" }}>TOTAL</div>
+                    <div style={{ borderTop:"1px solid #4a4f59", paddingTop:5, fontWeight:700, color:"#d9b16c", textAlign:"right" }}>${acqTotal.toFixed(1)}</div>
+                    <div style={{ borderTop:"1px solid #4a4f59", paddingTop:5, fontWeight:700, color:"#7cb87a", textAlign:"right" }}>+${divTotal.toFixed(2)}</div>
+                    <div style={{ borderTop:"1px solid #4a4f59", paddingTop:5, fontWeight:700, color:"#d88c8c", textAlign:"right" }}>−${intTotal.toFixed(2)}</div>
+                    <div style={{ borderTop:"1px solid #4a4f59", paddingTop:5, fontWeight:700, color:netAnnual>=0?"#7cb87a":"#d88c8c", textAlign:"right" }}>
+                      {netAnnual>=0?"+":""}${netAnnual.toFixed(2)}
+                    </div>
+                  </div>
+                  <div style={{ fontSize:10, color:"#8a909a", lineHeight:1.5, marginTop:6 }}>
+                    <strong style={{ color:"#d9b16c" }}>Balance sheet impact:</strong> gross debt rises by ${acqTotal.toFixed(1)}B
+                    one-off (+{debtPctGdp.toFixed(1)}pp GDP). Baseline gross debt 34.0% GDP →{" "}
+                    {(34.0 + debtPctGdp).toFixed(1)}% GDP after acquisition. Offset by equivalent increase in
+                    Commonwealth assets; net financial worth unchanged. PDI rises by ${intTotal.toFixed(2)}B/yr
+                    (this is added to the spending side).
+                  </div>
+                </div>
+              );
+            })()}
+
+            <Slider label="LNG export industry (Cth ownership share)" value={natLNG} min={0} max={100} step={5} onChange={setNatLNG}
+              display={v => v === 0 ? "Private" : `${v}% public`}
+              desc="Major Australian LNG operators (Woodside, Santos, Origin etc.). ~$80B operator market cap; ~$10B annual dividends at 100% ownership. At 25%: $20B acquisition + $2.5B dividends − $0.8B interest = net +$1.7B/yr."
+              note="Just-terms compensation: ~$80B × % at market value. Section 51(xxxi). Energy security argument; Henry Tax Review noted PRRT under-capture." />
+            <Slider label="Iron ore (Pilbara major operators)" value={natIronOre} min={0} max={100} step={5} onChange={setNatIronOre}
+              display={v => v === 0 ? "Private" : `${v}% public`}
+              desc="BHP/Rio Pilbara operations + FMG. ~$200B operator market cap; ~$20B annual dividends at 100%. At 25%: $50B acquisition + $5B dividends − $2.0B interest = net +$3.0B/yr."
+              note="Politically extreme. Pilbara constitutes ~$80B/yr export value. Historic precedent: Whitlam government 1974-75 mineral resources policy (never tested at scale)." />
+            <Slider label="Coal-fired generation (remaining private)" value={natCoalGen} min={0} max={100} step={5} onChange={setNatCoalGen}
+              display={v => v === 0 ? "Private" : `${v}% public`}
+              desc="~$30B remaining private coal generation assets. Cost-recovery operation post-acquisition: at 100%: $30B acquisition + $0.5B dividends − $1.2B interest = net −$0.7B/yr."
+              note="Already partly transitioning under Capacity Investment Scheme. Reliability argument: Cth ownership through transition could avoid premature closures." />
+            <Slider label="Big 4 banking" value={natBanking} min={0} max={100} step={5} onChange={setNatBanking}
+              display={v => v === 0 ? "Private" : `${v}% public`}
+              desc="CBA, NAB, ANZ, Westpac. ~$500B combined market cap; ~$25B annual dividends at 100%. At 25%: $125B acquisition + $6.25B dividends − $5.0B interest = net +$1.3B/yr."
+              note="Historic precedent: Chifley Bank Nationalisation Act 1947 (Cth) — struck down in Bank of NSW v Commonwealth (1948) under s.92 freedom of interstate trade; modern framing under s.51(xx) corporations power may survive. Distinct from CBA's privatisation reversal." />
+          </Sec>
+
+          <Sec title="17. Tax Expenditures, Withholding &amp; Credits" sub="$10.7B FTC + $1B MLS + withholding" delta={dFtcMls + dWithhold + dOtherTaxNew}>
+            <div style={{ background:"#363a43", border:"1px solid #7c828c", borderRadius:4, padding:"8px 10px", marginBottom:12, fontSize:10, color:"#c0c4cd", lineHeight:1.55 }}>
+              <strong style={{ color:"#9bbef7" }}>Tax expenditures and withholding taxes</strong> not
+              captured in the main sections above. The largest single item is the Fuel Tax Credit —
+              ~$10.7B/yr in foregone revenue, larger than the entire PRRT take and Australia's second-largest
+              tax expenditure after the CGT main residence exemption.
+            </div>
+
+            {/* Fuel Tax Credits */}
+            <div style={{ marginBottom:6, fontSize:10, color:"#d9b16c", fontWeight:600, letterSpacing:"0.04em" }}>Fuel Tax Credits (Fuel Tax Act 2006 Cth)</div>
+            <Slider label="FTC credit rate (% of full fuel excise)" value={ftcRate} min={0} max={100} step={5} onChange={setFtcRate}
+              display={v => v === 100 ? "100% — current law" : `${v}% of full excise`}
+              desc="FTC restores excise paid on diesel used for off-road, non-fuel-taxed purposes. Currently ~$10.7B/yr. Reducing to 50% recovers ~$5.4B. Each 10pp reduction ≈ +$1.07B."
+              note="Fuel Tax Act 2006 (Cth) s.41. Mining (~$8B) and agriculture (~$1.5B) are the dominant recipients. The Henry Review recommended reducing or removing the off-road credit for large mining operations." />
+            <div style={{ display:"flex", gap:16, marginBottom:14 }}>
+              {[
+                { id:"ftcMin", state:ftcMining, setter:setFtcMining, label:"Mining sector eligible", sub:"~$8B/yr credit. Mining lobby has successfully defended this for 20 years. Removal would be the largest single tax expenditure reform in Australian history.", rev:"removal ≈ +$8.0B" },
+                { id:"ftcAg",  state:ftcAg,     setter:setFtcAg,     label:"Agriculture sector eligible", sub:"~$1.5B/yr credit. Farmers' federation has consistently opposed removal. Some argue removal would increase food prices 1-3%.", rev:"removal ≈ +$1.5B" },
+              ].map(item => (
+                <div key={item.id} style={{ flex:1, display:"flex", alignItems:"flex-start", gap:8 }}>
+                  <input type="checkbox" id={item.id} checked={item.state} onChange={e => item.setter(e.target.checked)} style={{ marginTop:2 }} />
+                  <label htmlFor={item.id} style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.4 }}>
+                    {item.label}&nbsp;<span style={{ color:"#7cb87a" }}>({item.rev})</span>
+                    <span style={{ display:"block", color:"#6e7480", fontSize:9.5, marginTop:2 }}>{item.sub}</span>
+                  </label>
+                </div>
+              ))}
+            </div>
+
+            {/* Medicare Levy Surcharge */}
+            <div style={{ marginBottom:6, fontSize:10, color:"#d9b16c", fontWeight:600, letterSpacing:"0.04em" }}>Medicare Levy Surcharge</div>
+            <Slider label="MLS income threshold" value={mlsThreshold} min={60000} max={120000} step={1000} onChange={setMlsThreshold}
+              display={v => `$${v.toLocaleString()}`}
+              desc="Income above which MLS applies (no private hospital cover). Currently $93,000 (A New Tax Policy (Medicare Levy Surcharge) 1999 Cth). Each $10k reduction ≈ +$80M."
+              note="Threshold has not been indexed to wages since 2013-14. In real terms it has eroded significantly — more taxpayers are caught each year." />
+            <Slider label="MLS rate (lowest tier)" value={mlsRate} min={0.5} max={2.5} step={0.1} onChange={setMlsRate}
+              display={v => `${v.toFixed(1)}%`}
+              desc="Current lowest-tier rate is 1.0%. Applies above threshold; tiers 1.25% and 1.5% for higher incomes. Each 0.1pp increase ≈ +$90M." />
+
+            {/* Withholding taxes */}
+            <div style={{ marginBottom:6, marginTop:14, fontSize:10, color:"#d9b16c", fontWeight:600, letterSpacing:"0.04em" }}>Non-Resident Withholding Taxes (s.128B ITAA 1936)</div>
+            <div style={{ fontSize:10, color:"#6e7480", marginBottom:10, lineHeight:1.5 }}>
+              Total non-resident withholding yield ~$10B/yr. Treaty rates cap practical effective rates
+              for ~60 treaty partner jurisdictions; headline rates only apply to non-treaty countries.
+              Australia has comparatively low dividend and interest withholding rates versus OECD median.
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, marginBottom:14 }}>
+              {[
+                { id:"witDiv", val:withholdDiv, set:setWithholdDiv, label:"Dividend WHT", curr:30, max:45, desc:"Non-treaty; most treaty countries at 15-0%." },
+                { id:"witInt", val:withholdInt, set:setWithholdInt, label:"Interest WHT",  curr:10, max:30, desc:"Currently 10%; one of OECD's lowest." },
+                { id:"witRoy", val:withholdRoy, set:setWithholdRoy, label:"Royalty WHT",   curr:30, max:45, desc:"Currently 30%; key in mining/IP licensing." },
+              ].map(item => (
+                <div key={item.id} style={{ background:"#2d3139", border:"1px solid #4a4f59", borderRadius:4, padding:"8px 10px" }}>
+                  <div style={{ fontSize:10, color:"#7c828c", marginBottom:4 }}>{item.label}</div>
+                  <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                    <input className="numinput" type="number" value={item.val} min={0} max={item.max} step={1}
+                      style={{ width:50, fontSize:16, fontWeight:700 }}
+                      onChange={e => item.set(Math.max(0, Math.min(item.max, parseFloat(e.target.value)||0)))} />
+                    <span style={{ color:"#9bbef7", fontWeight:700 }}>%</span>
+                    {item.val !== item.curr && <span style={{ fontSize:10, color: item.val > item.curr ? "#7cb87a" : "#d88c8c" }}>
+                      {item.val > item.curr ? "+" : ""}{((item.val - item.curr) * (item.id==="witDiv"?0.15:item.id==="witInt"?0.08:0.10)).toFixed(2)}B
+                    </span>}
+                  </div>
+                  <div style={{ fontSize:9.5, color:"#565c66", marginTop:4 }}>{item.desc}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Div 293, R&D, LITO, Thin-cap */}
+            <div style={{ marginBottom:6, fontSize:10, color:"#d9b16c", fontWeight:600, letterSpacing:"0.04em" }}>Other Tax Expenditures &amp; Concessions</div>
+            <Slider label="Division 293 threshold (super — high income)" value={div293Thresh} min={150} max={300} step={5} onChange={setDiv293Thresh}
+              display={v => `$${v}k`}
+              desc="Additional 15% tax on super contributions for incomes above threshold. Currently $250k; ~80,000 individuals affected. Each $10k threshold reduction ≈ +$70M."
+              note="Treasury Laws Amendment (More Flexible Superannuation) 2020 (Cth). Reducing to $200k would bring ~160,000 additional individuals into Div 293." />
+            <Slider label="R&amp;D tax incentive — refundable offset rate" value={rdIncentive} min={25} max={50} step={0.5} onChange={setRdIncentive}
+              display={v => `${v.toFixed(1)}%`}
+              desc="Currently 43.5% refundable offset for companies with turnover <$20M; 33.5% non-refundable for large companies. ~$3.5B/yr total tax expenditure. Each 1pp reduction (small firm tier) ≈ -$50M cost (+$50M revenue)."
+              note="Treasury Laws Amendment (R&D Tax Incentive) Act 2020 (Cth). The R&D incentive is Australia's largest industry assistance program. Reducing below 30% would be internationally uncompetitive." />
+            <Slider label="Low Income Tax Offset (LITO) maximum" value={litoMax} min={200} max={1500} step={50} onChange={setLitoMax}
+              display={v => `$${v.toLocaleString()}`}
+              desc="Currently $700 (phases out $37,500-$66,667). Each $100 increase ≈ $700M cost. Reduces effective marginal rate for low-income earners."
+              note="ITAA 1997 s.159N. The LMITO (Low and Middle Income Tax Offset) ended 2022-23. Further LITO increases are the primary lever for personal income tax relief below the tax-free threshold reform." />
+            <Slider label="PAYG instalment variation (investment income)" value={paygInstalment} min={0} max={10} step={0.5} onChange={setPaygInstalment}
+              display={v => v === 0 ? "No change" : `+${v}% variation rate`}
+              desc="Increases PAYG instalment rate on investment and trust income. Timing effect — accelerates tax payment but does not change total liability. Each 1pp ≈ +$0.2B cash-flow improvement."
+              note="Income Tax Assessment Act 1936 (Cth) Part VI. PAYG instalments are revenue-neutral over the long run; this lever improves the budget-year cash position only." />
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:8 }}>
+              <input type="checkbox" id="thinCapTog" checked={thinCap} onChange={e => setThinCap(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="thinCapTog" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Further tighten thin capitalisation beyond 2023 reforms&nbsp;<span style={{ color:"#7cb87a" }}>(+$0.4B)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  Tax Laws Amendment (Thin Capitalisation) Act 2023 (Cth) already replaced the safe-harbour debt
+                  test with the arm's length and earnings-based tests. Further tightening would lower the 30%
+                  EBITDA limit or extend the rules to Australian-owned groups.
+                </span>
+              </label>
+            </div>
+          </Sec>
+        </div>
+
+        {/* ══ SPENDING COLUMN ══ */}
+        <div className="colR" style={S.colR}>
+          <div style={{ fontSize:10, color:"#7c828c", textTransform:"uppercase", letterSpacing:"0.1em",
+            marginBottom:10, paddingBottom:6, borderBottom:"1px solid #4a4f59" }}>
+            Spending Levers — 14 Categories
+          </div>
+
+          <Sec title="1.  Age Pension" sub="~$69B/yr" init={true} delta={dPension} deltaInv={true}>
+            <Slider label="Single fortnightly pension rate" value={pensRate} min={500} max={2500} step={10} onChange={setPensRate}
+              display={v => `$${v.toLocaleString()}/fn`}
+              desc="Max single rate incl. supplements (~$1,150/fn after 2026 indexation). ~2.6M recipients. Each $10/fn ≈ $680M/yr. Indexed twice-yearly under Social Security Act 1991 (Cth)." />
+            <Slider label="Eligibility age" value={pensAge} min={60} max={72} step={1} onChange={setPensAge}
+              display={v => `${v} yrs`}
+              desc="Currently 67. Each year of deferral saves ~$2.5B/yr." />
+            <Slider label="Assets test cutout — single homeowner" value={pensAsset} min={100} max={3000} step={50} onChange={setPensAsset}
+              display={v => `$${v.toLocaleString()}k`}
+              desc="Pension cuts out at ~$700k. Raising threshold = more recipients. Each $100k increase ≈ $1B/yr." />
+          </Sec>
+
+          <Sec title="2.  Welfare, Family &amp; Childcare" sub="~$98B/yr" delta={dWelfare} deltaInv={true}>
+            <Slider label="JobSeeker — single, no children" value={jsRate} min={200} max={2000} step={10} onChange={setJsRate}
+              display={v => `$${v.toLocaleString()}/fn`}
+              desc="~$810/fn (incl. 2025 base rate increase &amp; 2026 indexation). ~1M recipients. Total ~$18B/yr. Each $10/fn ≈ $450M." />
+            <Slider label="JobSeeker income test cutout" value={jsCutout} min={500} max={4000} step={50} onChange={setJsCutout}
+              display={v => `$${v.toLocaleString()}/fn income`}
+              desc="Income at which JobSeeker reduces to $0. Currently ~$1,390/fn. Each $100/fn ≈ $500M." />
+            <Slider label="Disability Support Pension — single" value={dspRate} min={500} max={2500} step={10} onChange={setDspRate}
+              display={v => `$${v.toLocaleString()}/fn`}
+              desc="~$1,150/fn (same indexation as Age Pension). ~760,000 recipients. Total ~$28B/yr (BP1 6.9.1)." />
+            <Slider label="DSP impairment threshold" value={dspPts} min={10} max={40} step={5} onChange={setDspPts}
+              display={v => `${v} impairment points`}
+              desc="Currently 20 points required under Social Security (Tables for the Assessment of Work-related Impairment for Disability Support Pension) Determination. Each 5pp higher ≈ $2.5B saving." />
+            <Slider label="Family Tax Benefit A (per child)" value={ftbA} min={0} max={800} step={10} onChange={setFtbA}
+              display={v => `$${v}/fn`}
+              desc="Per eligible dependent child (~3M children). Total ~$15B/yr (BP1 6.9.3)." />
+            <Slider label="Family Tax Benefit B (per family)" value={ftbB} min={0} max={600} step={10} onChange={setFtbB}
+              display={v => `$${v}/fn`}
+              desc="Single-income family supplement (~1.3M families). Total ~$7B/yr." />
+            <Slider label="Childcare subsidy (avg per day)" value={childcare} min={0} max={200} step={5} onChange={setChildcare}
+              display={v => `$${v}/day`}
+              desc="Average CCS contribution per subsidised day. Total ~$17B/yr in 2026-27, rising to $21.1B by 2029-30 (BP1 6.9.3)." />
+            <Slider label="Youth Allowance (single, away from home)" value={youthAllow} min={300} max={1500} step={10} onChange={setYouthAllow}
+              display={v => `$${v}/fn`}
+              desc="~$640/fn (Social Security Act 1991 (Cth) Part 2.11). ~200,000 recipients aged 16-24. Total ~$3.3B/yr. Each $10/fn ≈ $52M."
+              note="Includes students, apprentices, and job-seekers under 22. Means-tested against parental income for dependents." />
+            <Slider label="Austudy / ABSTUDY" value={austudy} min={300} max={1500} step={10} onChange={setAustudy}
+              display={v => `$${v}/fn`}
+              desc="~$700/fn (Social Security Act 1991 (Cth) Part 2.11A and ABSTUDY Policy Manual). ~50,000 Austudy + ~30,000 ABSTUDY recipients."
+              note="Austudy: full-time students 25+. ABSTUDY: Indigenous students all ages, with additional supports for remote/at-home cohorts." />
+          </Sec>
+
+          <Sec title="3.  Health &amp; Medicare" sub="~$137B/yr" delta={dHealth} deltaInv={true}>
+            <Slider label="GP bulk-billing rate" value={gpBulk} min={0} max={100} step={1} onChange={setGpBulk}
+              display={v => `${v}%`}
+              desc="~91% bulk-billed (up from 88% after Tripling Bulk Billing Incentive). Each 1pp ≈ $130M additional cost." />
+            <Slider label="Standard GP visit rebate (MBS Item 23)" value={gpRebate} min={0} max={150} step={1} onChange={setGpRebate}
+              display={v => `$${v}/visit`}
+              desc="~$44/consult after indexation. GP MBS total ~$11B/yr. Total MBS spending $47.2B 2026-27." />
+            <Slider label="NHRA hospital funding to states" value={hospital} min={0} max={200} step={1} onChange={setHospital}
+              display={v => `$${v}B/yr`}
+              desc="Cth contribution to public hospitals via National Health Reform Agreement Addendum. Baseline: $37.4B/yr (→$47.2B by 2029-30; fastest-growing program at 7.26% CAGR)." />
+            <Slider label="PBS co-payment — general patients" value={pbs} min={0} max={80} step={0.5} onChange={setPbs}
+              display={v => `$${v.toFixed(2)}/script`}
+              desc="Currently $31.60/script under National Health Act 1953 (Cth). ~350M scripts/yr. Each $1 increase ≈ $50M Cth saving (mostly borne by general patients)." />
+            <Slider label="Australian Centre for Disease Control (NEW)" value={acdc} min={0} max={2} step={0.1} onChange={setAcdc}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="ACDC established 1 January 2026 as a non-corporate Cth entity. 269 ASL. Baseline ~$200M ramping toward steady state."
+              note="Pandemic-preparedness scale would be $1B+/yr. Coordinates with Australian Health Protection Principal Committee and state health departments." />
+            <Slider label="Universal dental &amp; vision coverage" value={dentalVision} min={0} max={20} step={0.5} onChange={setDentalVision}
+              display={v => v === 0 ? "Off (CDBS only)" : `$${v.toFixed(1)}B/yr`}
+              desc="Currently mostly excluded from Medicare except limited CDBS (Child Dental Benefits Schedule) and pensioner schemes. Full universal coverage est. $10-15B/yr."
+              note="Would require Health Insurance Act 1973 (Cth) amendments to add dental and optical to the MBS. Workforce constraints (dental graduate pipeline) bind real-world rollout timing." />
+            <Slider label="Mental health" value={mentalHealth} min={0} max={20} step={0.1} onChange={setMentalHealth}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Mental Health Care Plans, Better Access program, Headspace, suicide prevention. Baseline: $7.4B/yr."
+              note="National Mental Health and Suicide Prevention Agreement 2022-2027. Workforce shortage (psychiatry, psychology) is a binding rollout constraint." />
+            <Slider label="Indigenous health (specific programs)" value={indigHealth} min={0} max={15} step={0.1} onChange={setIndigHealth}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="ACCHO sector funding, Indigenous Australians' Health Programme, remote health services. Baseline: $4.3B/yr."
+              note="Distinct from general Closing the Gap programs (Section 11). Includes Aboriginal Community Controlled Health Organisations under National Agreement on Closing the Gap." />
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginTop:6, marginBottom:6 }}>
+              <input type="checkbox" id="phiref" checked={phiReform} onChange={e => setPhiReform(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="phiref" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Modernising Private Health Insurance <BudgetBadge />&nbsp;<span style={{ color:"#7cb87a" }}>(−$0.75B/yr saving)</span>
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>
+                  Removes age-based PHI rebate uplift for higher-income earners. Private Health Insurance Act 2007
+                  (Cth) amendments. Affects high-income older policyholders receiving the 65+ and 70+ rebate uplift.
+                </span>
+              </label>
+            </div>
+          </Sec>
+
+          <Sec title="4.  NDIS" sub="~$56B/yr (post-reform)" delta={dNdisFull} deltaInv={true}>
+            <div style={{ background:"#363a43", border:"1px solid #7c828c", borderRadius:4, padding:"8px 10px", marginBottom:12, fontSize:10, color:"#c0c4cd", lineHeight:1.55 }}>
+              <strong style={{ color:"#9bbef7" }}>Reform context:</strong> The 2026-27 Budget&apos;s
+              &ldquo;Securing the NDIS for Future Generations&rdquo; measure saves $37.8B over 4 years.
+              CAGR cut from 7.6% (MYEFO trajectory) to 3.6% (Budget trajectory). Reform implemented under
+              National Disability Insurance Scheme Act 2013 (Cth) amendments and the National Disability
+              Insurance Scheme (Getting the NDIS Back on Track) Act 2024 (Cth).
+            </div>
+            <Slider label="Number of participants" value={ndisP} min={0} max={1000} step={10} onChange={setNdisP}
+              display={v => `${v.toLocaleString()}k people`}
+              desc="~720k participants under post-reform trajectory. Pre-reform was rising toward 1M+ by 2029-30." />
+            <Slider label="Average annual cost per participant" value={ndisCost} min={10} max={150} step={1} onChange={setNdisCost}
+              display={v => `$${v}k/person/yr`}
+              desc="Current avg ~$78k/yr. Reform tools: plan reviews, independent assessments, provider price controls, Thriving Kids supports (under-8s) diverted to states." />
+            <div style={{ ...S.note, marginBottom:10 }}>
+              NDIS total:&nbsp;
+              <span style={{ color:"#9bbef7", fontWeight:700 }}>${(ndisP * ndisCost / 1000).toFixed(1)}B</span>
+              <span style={{ color:"#565c66" }}>&nbsp;vs $56.1B baseline (
+                <span style={{ color: (ndisP*ndisCost/1000 - 56.16) <= 0 ? "#7cb87a":"#d88c8c" }}>
+                  {fmt(ndisP*ndisCost/1000 - 56.16, true)}
+                </span>)
+              </span>
+            </div>
+            <div style={{ paddingTop:10, borderTop:"1px solid #3a3e47" }}>
+              <div style={{ fontSize:10, color:"#d9b16c", fontWeight:600, marginBottom:8 }}>
+                2026-27 Budget measures — NDIS-adjacent supports
+              </div>
+              <Slider label={<span>Thriving Kids — early childhood supports <BudgetBadge /></span>}
+                value={thrivingKids} min={0} max={3} step={0.1} onChange={setThrivingKids}
+                display={v => v === 0 ? "Off" : `$${v.toFixed(1)}B/yr`}
+                desc="Disability supports for under-8s outside NDIS. Cth $2B + states $2B over forward estimates. Diverts new entrants from NDIS pipeline — net NDIS saving captured in participants slider above."
+                note="National Disability Insurance Scheme Act 2013 (Cth) amendments + bilateral state agreements." />
+              <Slider label={<span>National Foundational Supports (disability) <BudgetBadge /></span>}
+                value={foundSupports} min={0} max={2} step={0.05} onChange={setFoundSupports}
+                display={v => v === 0 ? "Off" : `$${v.toFixed(2)}B/yr`}
+                desc="Cth contribution to states for foundational disability supports (autism, development delay — below NDIS threshold). Baseline: $280M/yr (Budget allocation)."
+                note="Federal Financial Relations Act 2009 (Cth) Schedule A framework — Specific Purpose Payments to states." />
+            </div>
+          </Sec>
+
+          <Sec title="5.  Aged Care" sub="~$44B/yr" delta={dAgedCare} deltaInv={true}>
+            <Slider label="Avg annual in-home care package" value={inHome} min={0} max={80000} step={1000} onChange={setInHome}
+              display={v => `$${(v/1000).toFixed(0)}k/person/yr`}
+              desc="Support at Home program (from Aged Care Act 2024 (Cth), in effect 1 July 2025). ~900k recipients. Avg ~$22k/yr. Total in-home component ~$20B/yr." />
+            <Slider label="Govt share of residential care costs" value={resCare} min={0} max={100} step={5} onChange={setResCare}
+              display={v => `${v}%`}
+              desc="Govt covers ~70% of residential costs (~200,000 residents). Govt pays ~$17B/yr; means-tested resident contributions cover the rest." />
+          </Sec>
+
+          <Sec title="6.  Education (expanded)" sub="~$57B/yr" delta={dEdu} deltaInv={true}>
+            <Slider label="Federal funding per student" value={eduPerStu} min={0} max={25000} step={500} onChange={setEduPerStu}
+              display={v => `$${(v/1000).toFixed(1)}k/student/yr`}
+              desc="~$7,800/student/yr (Schooling Resource Standard, linked to Better and Fairer Schools Agreement). ~4M students; ~$32B Cth component." />
+            <Slider label="Early childhood education programs" value={earlyChild} min={0} max={8} step={0.1} onChange={setEarlyChild}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Preschool Reform Agreement, Australian Early Development Census, evidence-based programs. Baseline: $2.0B/yr."
+              note="Distinct from CCS childcare subsidy (which is means-tested fee assistance). This funds the educational program itself." />
+            <Slider label="VET / TAFE (National Skills Agreement)" value={vetTafe} min={0} max={10} step={0.1} onChange={setVetTafe}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Cth contribution to states under National Skills Agreement 2024-29. Baseline: $2.6B/yr."
+              note="Funded under Federal Financial Relations Act 2009 (Cth) framework. Includes Fee-Free TAFE places." />
+            <Slider label="University research grants (general)" value={uniRes} min={0} max={30} step={0.5} onChange={setUniRes}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Research block grants + competitive grants (general). Baseline: ~$10.5B/yr. Excludes CSIRO, NHMRC, ARC (broken out below)." />
+            <Slider label="CSIRO appropriation" value={csiroFund} min={0} max={3} step={0.05} onChange={setCsiroFund}
+              display={v => `$${v.toFixed(2)}B/yr`}
+              desc="Commonwealth Scientific and Industrial Research Organisation. Baseline: $1.0B/yr Cth appropriation."
+              note="Science and Industry Research Act 1949 (Cth). Generates additional external research income ~$700M/yr." />
+            <Slider label="NHMRC grants" value={nhmrcFund} min={0} max={3} step={0.05} onChange={setNhmrcFund}
+              display={v => `$${v.toFixed(2)}B/yr`}
+              desc="National Health and Medical Research Council. Baseline: $1.2B/yr."
+              note="National Health and Medical Research Council Act 1992 (Cth). Includes Investigator Grants, Ideas Grants, MRFF integration." />
+            <Slider label="ARC grants" value={arcFund} min={0} max={3} step={0.05} onChange={setArcFund}
+              display={v => `$${v.toFixed(2)}B/yr`}
+              desc="Australian Research Council. Baseline: $0.8B/yr."
+              note="Australian Research Council Act 2001 (Cth). Discovery Projects, Linkage Projects, Future Fellowships." />
+            <Slider label="Commonwealth student fee subsidy" value={uniSub} min={0} max={100} step={5} onChange={setUniSub}
+              display={v => v === 100 ? "100% — Free university" : v === 0 ? "0% — Full fees (abolish subsidy)" : `${v}%`}
+              desc="% of course cost covered under Commonwealth Grants Scheme (Higher Education Support Act 2003 (Cth)). Average ~45%." />
+            <Slider label="Regional/equity higher-ed loading" value={regHigherEd} min={0} max={3} step={0.1} onChange={setRegHigherEd}
+              display={v => v === 0 ? "None" : `$${v.toFixed(1)}B/yr`}
+              desc="Supplementary loading for regional access, equity cohorts, and TAFE-university collaboration."
+              note="Implements Australian Universities Accord (2024) recommendations on equity and regional participation." />
+          </Sec>
+
+          <Sec title="7.  Defence" sub="~$62B/yr" delta={dDefence} deltaInv={true}>
+            <Slider label="Defence spending as % of GDP" value={defence} min={0.5} max={5} step={0.05} onChange={setDefence}
+              display={v => `${v.toFixed(2)}% — $${(v*GDP/100).toFixed(0)}B/yr`}
+              desc={`Currently 2.02% of GDP ($62.5B 2026-27). Includes departmental + capital + Australian Submarine Agency. Each 0.1pp ≈ $3.1B.`}
+              note="Locked upward trajectory: Defence capital investment $9.3B (2026-27) → $13.6B by 2029-30 under 2026 National Defence Strategy & Integrated Investment Program. AUKUS Pillar I commitments adopted under Naval Nuclear Power Safety Act 2024 (Cth)." />
+          </Sec>
+
+          <Sec title="8.  Infrastructure" sub="~$23B/yr" delta={dInfra} deltaInv={true}>
+            <Slider label="Road &amp; rail capital program" value={roadRail} min={0} max={80} step={1} onChange={setRoadRail}
+              display={v => `$${v.toFixed(0)}B/yr`}
+              desc="National infrastructure pipeline. Baseline: $15.3B/yr 2026-27 (reduced by $2.0B Middle East conflict slippage adjustment, unwound 2030-36)."
+              note="Includes $3.8B Suburban Rail Loop East (Vic), $1.8B Australian Rail Track Corp, $659.6M High Speed Rail Authority. Inland Rail consolidation returned $4.4B equity to budget." />
+            <Slider label="Other infrastructure &amp; grants" value={otherInfra} min={0} max={30} step={0.5} onChange={setOtherInfra}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Airports, ports, community &amp; regional grants. Baseline: $8B/yr." />
+            <Slider label={<span>Local Infrastructure Fund (council grants) <BudgetBadge /></span>}
+              value={localInfraFund} min={0} max={2} step={0.05} onChange={setLocalInfraFund}
+              display={v => `$${v.toFixed(2)}B/yr`}
+              desc="Cth grants to local councils conditional on state planning reforms. Baseline: $262M (2026-27), scaling to $652M by 2029-30. Linked to National Housing Accord supply targets."
+              note="National Housing Accord 2022 framework; releases funds against state housing-supply benchmarks. Treated here as infrastructure spending (local roads, streetscapes, community facilities)." />
+          </Sec>
+
+          <Sec title="9.  Australian Public Service" sub="~$50B/yr" delta={dAps} deltaInv={true}>
+            <Slider label="APS civilian headcount (ASL)" value={aps} min={100} max={400} step={1} onChange={setAps}
+              display={v => `${v.toLocaleString()}k staff`}
+              desc="217,256 civilian ASL in 2026-27 (BP4 Table 2.3). Military + reserves: 86,660 separate. Each 1k staff ≈ $110M."
+              note="ASL cap abolished by Albanese government 2022. 13,200 contractor-to-APS conversions since 2022 (~1/3 of total growth). APS now at 0.76% of population (still below 2006-07 of 0.80%)." />
+            <Slider label="Wages — real increase above CPI" value={apsWage} min={-3} max={5} step={0.5} onChange={setApsWage}
+              display={v => `${v >= 0 ? "+" : ""}${v}% vs CPI`}
+              desc="Real-terms pay change above indexation. Total APS wage bill ~$50B/yr. Each 1% ≈ $500M." />
+          </Sec>
+
+          <Sec title="10. Climate &amp; Clean Energy" sub="~$15B/yr" delta={dClimate} deltaInv={true}>
+            <Slider label="Capacity investment scheme" value={capInv} min={0} max={40} step={0.5} onChange={setCapInv}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Underwriting clean energy generation and storage. Administered by AEMO/DCCEEW. Baseline: $8B/yr." />
+            <Slider label="Other environment programs" value={envProg} min={0} max={30} step={0.5} onChange={setEnvProg}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Nature Repair Market, biodiversity, emissions reduction. Includes new National Environmental Protection Agency (from 1 July 2026, 698 ASL). Baseline: $7B/yr." />
+          </Sec>
+
+          <Sec title="11. Other Spending" sub="~$50B adj. + $31.9B debt interest" delta={dOtherSp} deltaInv={true}>
+            <div style={{ ...S.note, marginBottom:12 }}>
+              <strong style={{ color:"#9bbef7" }}>Locked: Net interest on Commonwealth debt</strong> — $31.9B in 2026-27,
+              growing to $46.9B by 2029-30 (BP1 6.17; 8.77% CAGR). Cannot be adjusted via spending levers; affected only by debt path.
+              Total debt securities $987.6B in 2026-27, peaking at 35.8% of GDP in 2028-29.
+            </div>
+            <Slider label="Veterans&apos; affairs (DVA)" value={vets} min={0} max={40} step={0.5} onChange={setVets}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="DVA compensation, health treatment &amp; income support under Military Rehabilitation and Compensation Act 2004 (Cth). Baseline: $12.2B/yr." />
+            <Slider label="Foreign aid &amp; development (ODA)" value={aid} min={0} max={20} step={0.5} onChange={setAid}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Official Development Assistance. Baseline: $5.1B/yr. UN target: 0.7% GNI (~$22B). Currently ~0.17% GNI." />
+            <Slider label="Housing &amp; homelessness" value={housingP} min={0} max={60} step={0.5} onChange={setHousingP}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Commonwealth Rent Assistance (~$6B), Housing Australia Future Fund disbursements ($3B+ 2026-27), Social Housing &amp; Homelessness Agreement ($1.9B), Help to Buy (see below). Baseline: ~$11.4B/yr." />
+            <Slider label={<span>Help to Buy scheme <BudgetBadge /></span>}
+              value={helpToBuyExt} min={0} max={5} step={0.1} onChange={setHelpToBuyExt}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Shared-equity scheme: government holds a 30-40% equity stake in participant home; buyer needs smaller deposit and mortgage. Baseline: $1.6B (2026-27); growing ~71%/yr toward maturity."
+              note="Help to Buy Act 2024 (Cth) Schedule 1. Means-tested (income caps) and price-capped by region. Net budget cost reflects equity outlay less future equity recoveries on sale." />
+            <Slider label="Indigenous programs (Closing the Gap)" value={indig} min={0} max={20} step={0.5} onChange={setIndig}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="NIAA, land councils, community development, Indigenous health, education. Baseline: ~$6B/yr." />
+            <Slider label="Agriculture, water &amp; rural programs" value={agri} min={0} max={20} step={0.5} onChange={setAgri}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Drought relief, irrigation, biosecurity, farm grants. Baseline: ~$5B/yr." />
+            <Slider label="Immigration &amp; Home Affairs (admin)" value={immig} min={0} max={30} step={0.5} onChange={setImmig}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Visa processing, settlement services, citizenship administration. Baseline: ~$5B/yr (excludes ABF below)." />
+            <Slider label="Australian Border Force (operations)" value={borderForce} min={0} max={15} step={0.1} onChange={setBorderForce}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="ABF operations: customs, cargo screening, border patrol, immigration enforcement. Baseline: ~$2.8B/yr."
+              note="Australian Border Force Act 2015 (Cth). Separate from immigration administration. Includes Pacific Patrol Boat program and maritime patrol." />
+            <Slider label="Australian Federal Police" value={afp} min={0} max={10} step={0.1} onChange={setAfp}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="AFP operations: national security investigations, organised crime, cyber crime, international policing. Baseline: ~$2.4B/yr."
+              note="Australian Federal Police Act 1979 (Cth). Excludes state policing (state responsibility under residual constitutional powers)." />
+            <Slider label="Arts, sport &amp; culture" value={arts} min={0} max={10} step={0.5} onChange={setArts}
+              display={v => `$${v.toFixed(1)}B/yr`}
+              desc="Creative Australia, national institutions, elite sport funding. Baseline: ~$2B/yr." />
+          </Sec>
+
+          <Sec title="12. Higher Education Reform" sub="HELP &amp; equity loadings" delta={dHigherEd} deltaInv={true}>
+            <Slider label="HECS-HELP indexation rate" value={helpIndexation} min={0} max={8} step={0.5} onChange={setHelpIndexation}
+              display={v => v === 0 ? "Frozen" : `${v.toFixed(1)}%/yr`}
+              desc="Annual indexation of outstanding HELP debt (~$80B). Currently CPI under Higher Education Support Act 2003 (Cth). Each 1pp below 4% baseline ≈ +$400M Cth cost."
+              note="Recent high values (7.1% in 2023) prompted political backlash and the 20% one-off cut in 2025-26. Future settings under HESA amendments." />
+            <div style={{ ...S.note, marginBottom:8 }}>
+              Note: regional &amp; equity loading is in Section 6 above ($0–$3B/yr).
+              This section consolidates HELP indexation reform.
+            </div>
+          </Sec>
+
+          <Sec title="13. State &amp; Territory-specific commitments" sub="From BP2 2026-27" delta={dStates} deltaInv={true}>
+            <div style={{ background:"#363a43", border:"1px solid #7c828c", borderRadius:4, padding:"8px 10px", marginBottom:12, fontSize:10, color:"#c0c4cd", lineHeight:1.55 }}>
+              <strong style={{ color:"#9bbef7" }}>Identified state &amp; territory commitments:</strong> Major
+              Commonwealth-funded projects tied to specific jurisdictions. Baselines from BP2 (Budget Measures)
+              and BP3 (Federal Financial Relations) 2026-27. Most flow through the Federal Financial Relations
+              Act 2009 (Cth) Specific Purpose Payment framework or bespoke project agreements.
+            </div>
+
+            {/* New South Wales */}
+            <div style={{ fontSize:11, color:"#9bbef7", fontWeight:700, letterSpacing:"0.04em", marginTop:4, marginBottom:8, paddingBottom:3, borderBottom:"1px solid #3a3e47" }}>
+              New South Wales
+            </div>
+            <Slider label="Western Sydney Airport rail link" value={nswWSALink} min={0} max={1} step={0.01} onChange={setNswWSALink}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Cth-NSW 50/50 funded rail line to Western Sydney Airport (opens 2026). Baseline: $350M/yr average over delivery phase."
+              note="Funded under the Federation Funding Agreement framework; Cth share appropriated annually." />
+            <Slider label="HumeLink transmission (Cth contribution)" value={nswHumeLink} min={0} max={0.6} step={0.01} onChange={setNswHumeLink}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Cth equity contribution to HumeLink transmission project (Snowy 2.0 export capacity). Baseline: $240M/yr."
+              note="Rewiring the Nation Fund — Clean Energy Finance Corporation Act 2012 (Cth) amendments." />
+            <Slider label="M12 Motorway (Cth share)" value={nswM12} min={0} max={0.3} step={0.01} onChange={setNswM12}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="80/20 Cth-state funded Western Sydney access motorway. Baseline: $80M/yr Cth share."
+              note="National Land Transport Network (National Land Transport Act 2014 (Cth))." />
+
+            {/* Victoria */}
+            <div style={{ fontSize:11, color:"#9bbef7", fontWeight:700, letterSpacing:"0.04em", marginTop:14, marginBottom:8, paddingBottom:3, borderBottom:"1px solid #3a3e47" }}>
+              Victoria
+            </div>
+            <Slider label="Suburban Rail Loop East (Cth contribution)" value={vicSRL} min={0} max={5} step={0.1} onChange={setVicSRL}
+              display={v => v === 0 ? "Off" : `$${v.toFixed(1)}B/yr`}
+              desc="Cth $2.2B committed for SRL East stage. Baseline draws on Infrastructure Investment Program."
+              note="Significant project — Productivity Commission and Infrastructure Australia have raised cost-benefit concerns. Listed here as a fiscal lever, not an endorsement." />
+            <Slider label="Geelong Fast Rail (planning + early works)" value={vicGeelongRail} min={0} max={0.5} step={0.01} onChange={setVicGeelongRail}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Cth contribution to Geelong-Melbourne high-frequency rail. Baseline: $180M/yr (planning + corridor reservation)."
+              note="Subject to ongoing business case review by Infrastructure Australia." />
+            <Slider label="Yarra River recovery / urban cooling" value={vicYarraRecovery} min={0} max={0.15} step={0.005} onChange={setVicYarraRecovery}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="River recovery, riparian restoration, urban cooling tree-canopy program. Baseline: $40M/yr Cth share."
+              note="Joint Cth-VIC program under Environment Protection and Biodiversity Conservation Act 1999 (Cth)." />
+
+            {/* Queensland */}
+            <div style={{ fontSize:11, color:"#9bbef7", fontWeight:700, letterSpacing:"0.04em", marginTop:14, marginBottom:8, paddingBottom:3, borderBottom:"1px solid #3a3e47" }}>
+              Queensland
+            </div>
+            <Slider label="Bruce Highway annual contribution" value={qldBruceHwy} min={0} max={2} step={0.05} onChange={setQldBruceHwy}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Bruce Highway upgrade pipeline. Baseline: $700M/yr Cth share. Continuing 80/20 Cth/QLD funding model from 2024-25 reset."
+              note="National Land Transport Act 2014 (Cth). Cth Auditor-General has flagged ongoing project oversight issues." />
+            <Slider label="Brisbane 2032 Olympic infrastructure" value={qldOlympics} min={0} max={1} step={0.02} onChange={setQldOlympics}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Cth-QLD jointly funded venue and infrastructure pipeline 2026-31. Baseline: $300M/yr average."
+              note="Brisbane 2032 Olympic and Paralympic Games Arrangements Act 2021 (Qld) — Cth contributions appropriated bilaterally." />
+            <Slider label="CopperString transmission (Cth share)" value={qldCopperString} min={0} max={0.3} step={0.01} onChange={setQldCopperString}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="CopperString 2032 — Mt Isa to Townsville HVDC transmission. Baseline: $110M/yr Cth contribution."
+              note="Rewiring the Nation Fund. Connects North West Minerals Province to NEM." />
+
+            {/* Western Australia */}
+            <div style={{ fontSize:11, color:"#9bbef7", fontWeight:700, letterSpacing:"0.04em", marginTop:14, marginBottom:8, paddingBottom:3, borderBottom:"1px solid #3a3e47" }}>
+              Western Australia
+            </div>
+            <Slider label="Westport (Kwinana port) Cth share" value={waWestport} min={0} max={0.25} step={0.005} onChange={setWaWestport}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="New container port at Kwinana to replace Fremantle Inner Harbour. Baseline: $80M/yr Cth share."
+              note="National Land Transport Act 2014 (Cth) freight pathway designation." />
+            <Slider label="METRONET extensions" value={waMetronet} min={0} max={0.6} step={0.01} onChange={setWaMetronet}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Perth METRONET — Cth contribution to remaining station and line extensions. Baseline: $260M/yr."
+              note="Cth-WA Federation Funding Agreement on rail." />
+            <Slider label="Pilbara energy transition fund" value={waPilbaraEnergy} min={0} max={0.25} step={0.005} onChange={setWaPilbaraEnergy}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Cth co-investment in Pilbara grid and electrified mining. Baseline: $80M/yr."
+              note="Future Made in Australia Act 2024 (Cth) and Critical Minerals Production Tax Incentive framework." />
+
+            {/* South Australia */}
+            <div style={{ fontSize:11, color:"#9bbef7", fontWeight:700, letterSpacing:"0.04em", marginTop:14, marginBottom:8, paddingBottom:3, borderBottom:"1px solid #3a3e47" }}>
+              South Australia
+            </div>
+            <Slider label="Whyalla steelworks support" value={saWhyalla} min={0} max={1} step={0.01} onChange={setSaWhyalla}
+              display={v => v === 0 ? "Off" : `$${(v * 1000).toFixed(0)}M/yr`}
+              desc="2026-27 allocation: $121M (administration funding + grants). Part of broader green steel transition support."
+              note="Funded under Industry Research and Development Act 1986 (Cth) and bespoke appropriations." />
+            <Slider label="HMRB loan interest (Flinders/Adelaide medical research)" value={saHMRB} min={0} max={0.1} step={0.001} onChange={setSaHMRB}
+              display={v => `$${(v * 1000).toFixed(1)}M/yr`}
+              desc="Interest support on Health and Medical Research Building loans. Baseline: $12.4M (Flinders University 2024-25 financial report)."
+              note="Loan facility under Education Investment Fund Act 2008 (Cth) and Treasurer's directions." />
+            <Slider label="Northern Water Supply Project (Cth share)" value={saNorthernWater} min={0} max={0.2} step={0.005} onChange={setSaNorthernWater}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Desalination + pipeline to support Upper Spencer Gulf hydrogen/green iron industries. Baseline: $60M/yr Cth share."
+              note="Cth-SA Federation Funding Agreement; co-funded with Hydrogen Headstart program." />
+
+            {/* Tasmania */}
+            <div style={{ fontSize:11, color:"#9bbef7", fontWeight:700, letterSpacing:"0.04em", marginTop:14, marginBottom:8, paddingBottom:3, borderBottom:"1px solid #3a3e47" }}>
+              Tasmania
+            </div>
+            <Slider label="Macquarie Point precinct" value={tasMacqPoint} min={0} max={0.5} step={0.01} onChange={setTasMacqPoint}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Hobart waterfront redevelopment including AFL stadium precinct. Baseline: $240M Cth commitment over delivery."
+              note="Subject to ongoing tripartite agreement (Cth–TAS–Hobart City Council). State Parliament approval required." />
+            <Slider label="Bridgewater Bridge / Tasman Bridge replacement" value={tasBridge} min={0} max={0.6} step={0.01} onChange={setTasBridge}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Critical road infrastructure renewal. Baseline: $300M/yr Cth share over construction window."
+              note="National Land Transport Act 2014 (Cth)." />
+            <Slider label="Tasmanian Freight Equalisation Scheme" value={tasFreightEq} min={0} max={0.3} step={0.005} onChange={setTasFreightEq}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Subsidy for Bass Strait freight to offset disadvantage relative to mainland-only freight. Baseline: $165M/yr."
+              note="Tasmanian Freight Equalisation Scheme Act 1999 (Cth)." />
+
+            {/* Northern Territory */}
+            <div style={{ fontSize:11, color:"#9bbef7", fontWeight:700, letterSpacing:"0.04em", marginTop:14, marginBottom:8, paddingBottom:3, borderBottom:"1px solid #3a3e47" }}>
+              Northern Territory
+            </div>
+            <Slider label="Middle Arm sustainable development precinct" value={ntMiddleArm} min={0} max={0.6} step={0.01} onChange={setNtMiddleArm}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Darwin Middle Arm industrial precinct — LNG, hydrogen, critical minerals processing. Baseline: $300M/yr Cth commitment."
+              note="Controversial. Environment Protection and Biodiversity Conservation Act 1999 (Cth) approvals; ongoing concerns about emissions and Larrakia cultural heritage." />
+            <Slider label="Defence dual-use infrastructure (Tindal, Darwin)" value={ntDefenceDual} min={0} max={0.5} step={0.01} onChange={setNtDefenceDual}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="RAAF Base Tindal expansion, Darwin fuel storage and runway upgrades. Baseline: $220M/yr Cth direct."
+              note="AUKUS-aligned posture. Defence Act 1903 (Cth); Defence Force Posture initiatives." />
+
+            {/* Australian Capital Territory */}
+            <div style={{ fontSize:11, color:"#9bbef7", fontWeight:700, letterSpacing:"0.04em", marginTop:14, marginBottom:8, paddingBottom:3, borderBottom:"1px solid #3a3e47" }}>
+              Australian Capital Territory
+            </div>
+            <Slider label="Light Rail Stage 2A (Cth contribution)" value={actLightRail} min={0} max={0.15} step={0.002} onChange={setActLightRail}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Cth contribution to Canberra Light Rail Stage 2A (City to Commonwealth Park). Baseline: $44M/yr."
+              note="Cth-ACT bilateral; ACT remains a self-governing territory under Australian Capital Territory (Self-Government) Act 1988 (Cth)." />
+            <Slider label="National institutions baseline (AWM, NLA, NGA)" value={actNatInst} min={0} max={0.4} step={0.005} onChange={setActNatInst}
+              display={v => v === 0 ? "Off" : `$${(v*1000).toFixed(0)}M/yr`}
+              desc="Cth uplift to Australian War Memorial, National Library, National Gallery operational budgets. Baseline: $180M/yr."
+              note="National institutions are Cth statutory authorities under their respective enabling Acts (e.g. National Library Act 1960 (Cth))." />
+          </Sec>
+
+          {/* ─ COMMONWEALTH ENTERPRISES ─ */}
+          <Sec title="14. Commonwealth Government Enterprises" sub="GBEs, re-acquisition &amp; new corporations" delta={dGbe} deltaInv={false}>
+            <div style={{ background:"#363a43", border:"1px solid #7c828c", borderRadius:4, padding:"8px 10px", marginBottom:12, fontSize:10, color:"#c0c4cd", lineHeight:1.55 }}>
+              <strong style={{ color:"#9bbef7" }}>Governance framework:</strong> Commonwealth GBEs and companies
+              are governed by the Public Governance, Performance and Accountability Act 2013 (Cth). Dividend
+              policy is set by the Finance Minister; new entity creation requires primary legislation and an
+              equity injection from the Consolidated Revenue Fund (s.83 Constitution). Re-acquisition of
+              privatised assets is a voluntary market purchase — no constitutional constraint on willing-seller
+              transactions, unlike forced acquisition under s.51(xxxi). Annual returns flow to revenue; acquisition
+              debt service and capitalisation costs appear here as spending.
+            </div>
+
+            {/* ── A. Existing GBEs — dividend uplift ── */}
+            <div style={{ fontSize:10, color:"#d9b16c", fontWeight:600, letterSpacing:"0.04em", marginBottom:8 }}>
+              A. Existing Commonwealth GBEs — dividend policy
+            </div>
+            {[
+              { id:"gbeAP",   val:gbeAusPost,    set:setGbeAusPost,    max:800,  step:20, label:"Australia Post",
+                baseline:"~$200M/yr", act:"Australia Post Corporation Act 1989 (Cth)",
+                note:"Parcels growing; letters structurally declining. Capped at ~$800M above baseline before threatening capital adequacy and network maintenance." },
+              { id:"gbeNBN",  val:gbeNBN,         set:setGbeNBN,        max:2000, step:50, label:"NBN Co",
+                baseline:"$0 dividend (repaying $19.5B equity)", act:"NBN Co Limited — unlisted Cth company",
+                note:"Not yet paying dividends. Modelled as efficiency target / partial stake sale proceeds. Commercial return expected post-2028 after equity repayment." },
+              { id:"gbeSnwy", val:gbeSnowyHydro,  set:setGbeSnowyHydro, max:600,  step:20, label:"Snowy Hydro",
+                baseline:"~$250M/yr", act:"Snowy Hydro Limited — Cth 100% since 2020",
+                note:"Snowy 2.0 capital expenditure (~$12B) constrains additional dividends until commissioning (~2028). Post-commissioning uplifts of $200-400M/yr are realistic." },
+              { id:"gbeDHA",  val:gbeDefHousing,  set:setGbeDefHousing,  max:300,  step:10, label:"Defence Housing Australia",
+                baseline:"~$100M/yr", act:"Defence Housing Australia Act 1987 (Cth)",
+                note:"Large residential property portfolio (~18,500 dwellings). Dividend constrained by need to maintain housing stock for ADF members." },
+              { id:"gbeASTO", val:gbeAnsto,        set:setGbeAnsto,       max:100,  step:5,  label:"ANSTO (commercial arm)",
+                baseline:"~$20M/yr", act:"Australian Nuclear Science and Technology Organisation Act 1987 (Cth)",
+                note:"Commercial arm includes nuclear medicine (MolyPlex, Yttrium-90), research reactors, and environmental services. Growing export opportunity in nuclear medicine." },
+              { id:"gbeAirS", val:gbeAirservices,  set:setGbeAirservices, max:250,  step:10, label:"Airservices Australia",
+                baseline:"~$130M/yr", act:"Air Services Act 1995 (Cth)",
+                note:"Air traffic management and aviation rescue; entirely user-funded via aeronautical charges. Surplus constrained by regulatory compact with airlines." },
+              { id:"gbeMint", val:gbeMint,          set:setGbeMint,        max:80,   step:5,  label:"Royal Australian Mint",
+                baseline:"~$30M/yr", act:"Royal Australian Mint Act 2012 (Cth)",
+                note:"Manufactures Australian circulating coinage + collectibles. Revenue from seigniorage (face value minus minting cost). Limited uplift headroom." },
+              { id:"gbeATIC", val:gbeAusTrade,      set:setGbeAusTrade,    max:50,   step:2,  label:"Austrade commercial operations",
+                baseline:"~$5M/yr", act:"Australian Trade and Investment Commission Act 1985 (Cth)",
+                note:"Modest commercial services (trade publications, data subscriptions). Primarily a policy body; not a significant revenue source." },
+            ].map(item => (
+              <div key={item.id} style={{ background:"#2d3139", border:"1px solid #4a4f59", borderRadius:5, padding:"10px 12px", marginBottom:8 }}>
+                <div style={{ display:"flex", alignItems:"baseline", gap:8, marginBottom:4 }}>
+                  <span style={{ fontSize:11, fontWeight:600, color:"#c0c4cd" }}>{item.label}</span>
+                  <span style={{ fontSize:9, color:"#565c66" }}>{item.act}</span>
+                  {item.val > 0 && <span style={{ fontSize:10, color:"#7cb87a", marginLeft:"auto" }}>+${item.val}M/yr</span>}
+                </div>
+                <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:4 }}>
+                  <input className="numinput" type="range" min={0} max={item.max} step={item.step}
+                    value={item.val} onChange={e => item.set(parseFloat(e.target.value))} style={{ flex:1 }} />
+                  <span style={{ fontSize:12, fontWeight:700, color:"#9bbef7", minWidth:52, textAlign:"right" }}>
+                    ${item.val}M
+                  </span>
+                </div>
+                <div style={{ fontSize:9, color:"#6e7480", lineHeight:1.4 }}>
+                  Baseline: {item.baseline}. {item.note}
+                </div>
+              </div>
+            ))}
+
+            {/* ── B. Re-acquisition of privatised government assets ── */}
+            <div style={{ fontSize:10, color:"#d9b16c", fontWeight:600, letterSpacing:"0.04em", marginTop:16, marginBottom:8 }}>
+              B. Re-acquisition of privatised government assets
+            </div>
+            <div style={{ fontSize:10, color:"#6e7480", marginBottom:10, lineHeight:1.5 }}>
+              Sliders set a Commonwealth ownership percentage via voluntary market purchase (no s.51(xxxi) forced acquisition required
+              for open-market transactions). Annual dividends flow to revenue; debt service at 4.0% CGS yield flows here as spending cost.
+              Net annual effect = dividends − interest on acquisition price. One-off balance-sheet impact: gross debt rises by acquisition cost.
+            </div>
+            {[
+              { id:"raqTel",  val:reAcqTelstra,   set:setReAcqTelstra,
+                label:"Telstra", privYear:"1997–2006", mktCapB:40, divB:1.6,
+                note:"Privatised in three tranches (T1, T2, T3) under Howard government. Cth currently holds NBN migration assurance shares only. 100% re-acquisition: $40B cost, $1.6B dividends, $1.6B interest = net $0/yr. 25%: $10B, $400M dividends, $400M interest." },
+              { id:"raqApt",  val:reAcqAirports,  set:setReAcqAirports,
+                label:"Major privatised airports (Sydney, Melbourne, Brisbane)", privYear:"1996–2002", mktCapB:30, divB:1.2,
+                note:"Leased to private operators under Airports Act 1996 (Cth). Leases run to 2096. Re-acquisition means buying out leaseholder equity. Sydney Airport alone ~$9B equity." },
+              { id:"raqPrt",  val:reAcqPorts,     set:setReAcqPorts,
+                label:"Major privatised ports (Port of Melbourne, Port Botany, Fremantle)", privYear:"2016–2021", mktCapB:15, divB:0.5,
+                note:"Ports privatised by state governments; Cth acquisition would require inter-governmental agreement and legislation. State sovereignty concerns apply." },
+              { id:"raqCBA",  val:reAcqCommsBank, set:setReAcqCommsBank,
+                label:"Commonwealth Bank of Australia", privYear:"1991–1996", mktCapB:185, divB:9.0,
+                note:"Largest Australian company by market cap. 100% re-acquisition: $185B cost, $9B dividends, $7.4B interest = net +$1.6B/yr. Politically extreme; would disrupt financial system significantly. Chifley Bank Nationalisation precedent (struck down 1948) is distinct — that was forced acquisition; voluntary purchase is not constitutionally constrained." },
+            ].map(item => {
+              const acq = item.mktCapB * item.val / 100;
+              const div = item.divB   * item.val / 100;
+              const int = acq * 0.04;
+              const net = div - int;
+              return (
+                <div key={item.id} style={{ background:"#2d3139", border:"1px solid #4a4f59", borderRadius:5, padding:"10px 12px", marginBottom:10 }}>
+                  <div style={{ display:"flex", alignItems:"baseline", gap:8, marginBottom:4, flexWrap:"wrap" }}>
+                    <span style={{ fontSize:11, fontWeight:600, color:"#c0c4cd" }}>{item.label}</span>
+                    <span style={{ fontSize:9, color:"#565c66" }}>privatised {item.privYear}</span>
+                  </div>
+                  <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
+                    <input className="numinput" type="range" min={0} max={100} step={1}
+                      value={item.val} onChange={e => item.set(parseFloat(e.target.value))} style={{ flex:1 }} />
+                    <span style={{ fontSize:13, fontWeight:700, color:"#9bbef7", minWidth:36 }}>{item.val}%</span>
+                  </div>
+                  {item.val > 0 && (
+                    <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:6, marginBottom:6 }}>
+                      {[
+                        { l:"Acquisition cost", v:`$${acq.toFixed(1)}B`, c:"#d9b16c" },
+                        { l:"Dividends/yr",      v:`+$${div.toFixed(2)}B`, c:"#7cb87a" },
+                        { l:"Interest/yr",       v:`-$${int.toFixed(2)}B`, c:"#d88c8c" },
+                        { l:"Net/yr",            v:`${net>=0?"+":""}$${net.toFixed(2)}B`, c:net>=0?"#7cb87a":"#d88c8c" },
+                      ].map((cell,i) => (
+                        <div key={i} style={{ background:"#252830", borderRadius:3, padding:"4px 6px" }}>
+                          <div style={{ fontSize:8, color:"#6e7480" }}>{cell.l}</div>
+                          <div style={{ fontSize:11, fontWeight:700, color:cell.c }}>{cell.v}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ fontSize:9, color:"#6e7480", lineHeight:1.4 }}>{item.note}</div>
+                </div>
+              );
+            })}
+
+            {/* ── C. Asset recycling ── */}
+            <div style={{ fontSize:10, color:"#d9b16c", fontWeight:600, letterSpacing:"0.04em", marginTop:16, marginBottom:8 }}>
+              C. Asset recycling / partial privatisation
+            </div>
+            <Slider label="Asset sale proceeds (amortised over 10 yrs)" value={gbeAssetSales} min={0} max={30} step={0.5} onChange={setGbeAssetSales}
+              display={v => v === 0 ? "No sales" : `$${v.toFixed(1)}B one-off`}
+              desc="Partial privatisation or sale of Commonwealth assets (e.g. NBN Co partial stake, ANSTO commercial arm, Defence Housing portfolios). $5B sale ≈ +$500M/yr amortised."
+              note="Infrastructure recycling under Asset Recycling Initiative (2014 precedent). Any sale of a statutory authority requires legislative amendment. Proceeds to Consolidated Revenue Fund (s.83 Constitution)." />
+
+            {/* ── D. New proposed Commonwealth corporations ── */}
+            <div style={{ fontSize:10, color:"#d9b16c", fontWeight:600, letterSpacing:"0.04em", marginTop:16, marginBottom:6 }}>
+              D. New proposed Commonwealth corporations
+            </div>
+            <div style={{ fontSize:10, color:"#6e7480", marginBottom:10, lineHeight:1.5 }}>
+              Each corporation is a separate lever. 20% of capitalisation is spent in the budget year (equity deployed);
+              50% of the annual return is credited to revenue in the budget year (ramp-up). Net budget-year effect is
+              negative initially; returns compound from Year 3. All require primary legislation.
+            </div>
+            {[
+              { id:"hfc",  tog:gbeHousingCorp,  setTog:setGbeHousingCorp,  cap:gbeHousingCapB,  setCap:setGbeHousingCapB,
+                name:"Commonwealth Housing Finance Corporation (CHFC)",
+                act:"New enabling Act modelled on CEFC Act 2012 (Cth)",
+                ret:0.045, desc:"Concessional lending (CPI+1%) to community housing providers and state housing authorities. Target: 120,000 social/affordable dwellings over 5 years.",
+                maxCap:30 },
+              { id:"mfg",  tog:gbeMfgCorp,      setTog:setGbeMfgCorp,      cap:gbeMfgCapB,      setCap:setGbeMfgCapB,
+                name:"Australian Strategic Manufacturing Corporation (ASMC)",
+                act:"NRF Corporation Act 2023 (Cth) expanded mandate or new Act",
+                ret:0.070, desc:"Co-invests in mRNA pharmaceutical manufacturing, semiconductor packaging, naval supply chains, and defence-critical industrial base. AUKUS alignment.",
+                maxCap:30 },
+              { id:"crm",  tog:gbeCritMin,      setTog:setGbeCritMin,      cap:gbeCritMinCapB,  setCap:setGbeCritMinCapB,
+                name:"Australian Critical Minerals Investment Corporation (ACMIC)",
+                act:"New Act; FIRB oversight; allied-government co-investment",
+                ret:0.090, desc:"Equity co-investor in lithium hydroxide, cobalt sulfate, and rare-earth oxide refining. Targets 15% reduction in Chinese processing dependency by 2030.",
+                maxCap:20 },
+              { id:"cdb",  tog:gbeRegBank,      setTog:setGbeRegBank,      cap:gbeRegBankCapB,  setCap:setGbeRegBankCapB,
+                name:"Commonwealth Development Bank (CDB)",
+                act:"New Commonwealth Development Bank Act — revives CDB wound up 1996",
+                ret:0.060, desc:"SME, regional, and export lending where private finance is uncompetitive. Modelled on KfW (Germany), BDC (Canada), BPIFRANCE. Targets manufacturing and agriculture sectors.",
+                maxCap:30 },
+              { id:"rwc",  tog:gbeRewiringCorp, setTog:setGbeRewiringCorp, cap:gbeRewiringCapB, setCap:setGbeRewiringCapB,
+                name:"Rewiring Australia Corporation (RAC)",
+                act:"New Act analogous to ARENA Act 2011 (Cth) — commercially structured",
+                ret:0.055, desc:"Finances HumeLink, Project EnergyConnect, Marinus Link transmission via green bonds + concessional equity. On-sells capacity agreements. Supports 82% renewable target by 2030.",
+                maxCap:25 },
+              { id:"fnwf", tog:gbeFirstNations, setTog:setGbeFirstNations, cap:gbeFirstNatCapB, setCap:setGbeFirstNatCapB,
+                name:"First Nations Wealth Fund (FNWF)",
+                act:"New Act analogous to Future Fund Act 2006 (Cth) — distinct beneficiary class",
+                ret:0.080, desc:"Sovereign-wealth model investing globally. Distributions to Community Development Trust for First Nations economic programs. Funded by hypothecated minerals levy. Future Fund precedent: ~9.5%/yr since 2006.",
+                maxCap:20 },
+            ].map(item => {
+              const budgetYearNet = item.tog ? item.cap * (item.ret * 0.5 - 0.20) : 0;
+              return (
+                <div key={item.id} style={{ background:"#2d3139", border:"1px solid #4a4f59", borderRadius:5, padding:"10px 12px", marginBottom:10 }}>
+                  <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:8 }}>
+                    <input type="checkbox" id={`gbetog_${item.id}`} checked={item.tog}
+                      onChange={e => item.setTog(e.target.checked)} style={{ marginTop:2 }} />
+                    <label htmlFor={`gbetog_${item.id}`} style={{ cursor:"pointer", flex:1 }}>
+                      <div style={{ fontSize:11, fontWeight:600, color:"#c0c4cd", marginBottom:2 }}>{item.name}</div>
+                      <div style={{ fontSize:9.5, color:"#6e7480" }}>{item.act}</div>
+                    </label>
+                    {item.tog && (
+                      <span style={{ fontSize:10, fontWeight:700, color: budgetYearNet >= 0 ? "#7cb87a" : "#d88c8c", whiteSpace:"nowrap" }}>
+                        {budgetYearNet >= 0 ? "+" : ""}${budgetYearNet.toFixed(1)}B net yr1
+                      </span>
+                    )}
+                  </div>
+                  {item.tog && (<>
+                    <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
+                      <span style={{ fontSize:10, color:"#8a909a", minWidth:80 }}>Capitalisation:</span>
+                      <input className="numinput" type="range" min={1} max={item.maxCap} step={1}
+                        value={item.cap} onChange={e => item.setCap(parseFloat(e.target.value))} style={{ flex:1 }} />
+                      <span style={{ fontSize:13, fontWeight:700, color:"#9bbef7", minWidth:42 }}>${item.cap}B</span>
+                    </div>
+                    <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:6, marginBottom:6 }}>
+                      {[
+                        { l:"Budget-yr spend",  v:`$${(item.cap * 0.20).toFixed(1)}B`, c:"#d88c8c" },
+                        { l:"Annual return",    v:`$${(item.cap * item.ret).toFixed(2)}B (${(item.ret*100).toFixed(1)}%)`, c:"#7cb87a" },
+                        { l:"Year-1 net",       v:`${budgetYearNet>=0?"+":""}$${budgetYearNet.toFixed(2)}B`, c:budgetYearNet>=0?"#7cb87a":"#d88c8c" },
+                      ].map((cell,i) => (
+                        <div key={i} style={{ background:"#252830", borderRadius:3, padding:"4px 6px" }}>
+                          <div style={{ fontSize:8, color:"#6e7480" }}>{cell.l}</div>
+                          <div style={{ fontSize:11, fontWeight:700, color:cell.c }}>{cell.v}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ fontSize:9.5, color:"#8a909a", lineHeight:1.4 }}>{item.desc}</div>
+                  </>)}
+                </div>
+              );
+            })}
+
+            {/* Generic new corp lever (kept for back-compat) */}
+            <div style={{ fontSize:10, color:"#7c828c", marginTop:12, marginBottom:6, fontStyle:"italic" }}>
+              Generic investment vehicle (alternative to named corporations above)
+            </div>
+            <div style={{ display:"flex", alignItems:"flex-start", gap:8, marginBottom:8 }}>
+              <input type="checkbox" id="gbeNewCorpTog" checked={gbeNewCorp} onChange={e => setGbeNewCorp(e.target.checked)} style={{ marginTop:2 }} />
+              <label htmlFor="gbeNewCorpTog" style={{ fontSize:11, color:"#c0c4cd", cursor:"pointer", lineHeight:1.5 }}>
+                Generic Commonwealth strategic investment corporation
+                <span style={{ display:"block", color:"#6e7480", fontSize:10 }}>Custom capitalisation and return target. Use for scenarios not covered by the named corporations above.</span>
+              </label>
+            </div>
+            {gbeNewCorp && (<>
+              <Slider label="Capitalisation" value={gbeNewCorpSize} min={1} max={50} step={1} onChange={setGbeNewCorpSize}
+                display={v => `$${v}B`} desc="20% deployed in budget year. Full return modelled from year 3." />
+              <Slider label="Target annual return" value={gbeNewCorpYield} min={2} max={15} step={0.5} onChange={setGbeNewCorpYield}
+                display={v => `${v.toFixed(1)}%/yr`} desc="50% of annual return credited in budget year as ramp-up." />
+            </>)}
+          </Sec>
+
+          {/* ── Sec 15. Commonwealth Investment Funds ───────────────────── */}
+          <Sec title="15. Commonwealth Investment Funds" sub={`${AUM_FUNDS_TOTAL.toFixed(0)}B AUM across 9 funds`} delta={dFunds} deltaInv={false}>
+            <div style={{ background:"#363a43", border:"1px solid #7c828c", borderRadius:4,
+              padding:"8px 10px", marginBottom:12, fontSize:10, color:"#c0c4cd", lineHeight:1.55 }}>
+              <strong style={{ color:"#9bbef7" }}>Governance framework:</strong> Seven funds (
+              Future Fund, MRFF, DCAF, ATSILSFF, FDF, DRF, HAFF) are managed by the
+              Future Fund Board of Guardians under the Future Fund Act 2006 (Cth) and
+              individual enabling Acts. CEFC and NRFC operate as separate Commonwealth
+              corporations under their own Acts. Sales or dissolutions require Parliamentary
+              repeal of the enabling Act, and forced sale typically carries 5-15% market
+              discount (not modelled here — face-value AUM is used). The Future Fund Act
+              permits withdrawal from 1 July 2020, but the 2017 Government commitment
+              defers withdrawals to 2026-27.
+              <br /><br />
+              <strong style={{ color:"#d9b16c" }}>Total Commonwealth investment AUM: ${AUM_FUNDS_TOTAL.toFixed(1)}B</strong>
+              {' '}(31 December 2025 figures).
+            </div>
+
+            {/* ── A. Future Fund Board of Guardians funds ── */}
+            <div style={{ fontSize:10, color:"#d9b16c", fontWeight:600, letterSpacing:"0.04em", marginBottom:8 }}>
+              A. Future Fund Board of Guardians funds (Future Fund Act 2006)
+            </div>
+
+            {/* Future Fund itself */}
+            <div style={{ background:"#252830", border:"1px solid #3a3f48", borderRadius:4,
+              padding:"10px 12px", marginBottom:10 }}>
+              <div style={{ fontSize:11, color:"#c8d0dc", fontWeight:600, marginBottom:4 }}>
+                Future Fund — ${AUM_FUTURE_FUND}B AUM
+              </div>
+              <div style={{ fontSize:10, color:"#9da3ae", marginBottom:8, lineHeight:1.5 }}>
+                Sovereign wealth fund. Original purpose: unfunded public servant superannuation
+                liabilities. Mandate target return CPI+4-5%. Withdrawals deferred to 2026-27.
+              </div>
+              <Slider label="Additional capital contribution" value={ffContrib} min={0} max={50} step={1}
+                onChange={setFfContrib} display={v => `$${v}B`}
+                desc="One-off injection. Reduces UCB this year; compounds in forward estimates." />
+              <Slider label="Target return mandate" value={ffTargetReturn} min={2} max={8} step={0.25}
+                onChange={setFfTargetReturn} display={v => `${v.toFixed(2)}%/yr`}
+                desc="CPI+4-5% statutory. Higher target = more risk; lower = preservation focus." />
+              <Slider label="Early drawdown to UCB" value={ffEarlyDraw} min={0} max={30} step={1}
+                onChange={setFfEarlyDraw} display={v => `$${v}B/yr`}
+                desc="Future Fund Act permits withdrawal from 2020. Government committed to defer to 2026-27; this models early access." />
+              <Slider label="Partial sale (% of AUM)" value={ffSalePct} min={0} max={100} step={5}
+                onChange={setFfSalePct} display={v => `${v}%`}
+                desc={`Liquidate ${ffSalePct}% of ${AUM_FUTURE_FUND}B = $${(AUM_FUTURE_FUND * ffSalePct / 100).toFixed(1)}B one-off revenue. Requires Future Fund Act amendment.`} />
+              <Toggle warn={true} label="Full dissolution" checked={ffDissolve} onChange={setFfDissolve}
+                desc="Wind up Future Fund; AUM returned to Consolidated Revenue Fund. Requires repeal of Future Fund Act 2006." />
+            </div>
+
+            {/* MRFF */}
+            <div style={{ background:"#252830", border:"1px solid #3a3f48", borderRadius:4,
+              padding:"10px 12px", marginBottom:10 }}>
+              <div style={{ fontSize:11, color:"#c8d0dc", fontWeight:600, marginBottom:4 }}>
+                Medical Research Future Fund (MRFF) — ${AUM_MRFF}B AUM
+              </div>
+              <div style={{ fontSize:10, color:"#9da3ae", marginBottom:8, lineHeight:1.5 }}>
+                Medical Research Future Fund Act 2015. ~$650M/yr currently disbursed to medical
+                research. Mandate target RBA cash + 1.5-2%.
+              </div>
+              <Slider label="Additional contribution" value={mrffContrib} min={0} max={20} step={1}
+                onChange={setMrffContrib} display={v => `$${v}B`} desc="Top-up beyond $20B target." />
+              <Slider label="Disbursement uplift vs baseline" value={mrffDisburseAdj} min={-0.65} max={5} step={0.05}
+                onChange={setMrffDisburseAdj} display={v => `${v >= 0 ? '+' : ''}$${v.toFixed(2)}B/yr`}
+                desc="Currently $650M/yr to medical research. Set negative to reduce; positive to expand." />
+              <Slider label="Partial sale" value={mrffSalePct} min={0} max={100} step={5}
+                onChange={setMrffSalePct} display={v => `${v}%`}
+                desc={`${mrffSalePct}% liquidation = $${(AUM_MRFF * mrffSalePct / 100).toFixed(1)}B one-off.`} />
+              <Toggle warn={true} label="Full dissolution" checked={mrffDissolve} onChange={setMrffDissolve}
+                desc="Wind up MRFF. Requires repeal of MRFF Act 2015. Medical research funding would revert to direct appropriation." />
+            </div>
+
+            {/* DCAF */}
+            <div style={{ background:"#252830", border:"1px solid #3a3f48", borderRadius:4,
+              padding:"10px 12px", marginBottom:10 }}>
+              <div style={{ fontSize:11, color:"#c8d0dc", fontWeight:600, marginBottom:4 }}>
+                DisabilityCare Australia Fund (DCAF) — ${AUM_DCAF}B AUM
+              </div>
+              <div style={{ fontSize:10, color:"#9da3ae", marginBottom:8, lineHeight:1.5 }}>
+                DisabilityCare Australia Fund Act 2013. Funded by the 0.5% Medicare Levy increase
+                introduced in 2014. Conservative deposits-only mandate.
+              </div>
+              <Slider label="Additional contribution" value={dcafContrib} min={0} max={20} step={1}
+                onChange={setDcafContrib} display={v => `$${v}B`} desc="Capital top-up for NDIS sustainability." />
+              <Slider label="NDIS disbursement uplift" value={dcafDisburseAdj} min={-2} max={10} step={0.25}
+                onChange={setDcafDisburseAdj} display={v => `${v >= 0 ? '+' : ''}$${v.toFixed(2)}B/yr`}
+                desc="Additional flow from DCAF to NDIS funding. Currently used as buffer for State NDIS contributions." />
+              <Slider label="Partial sale" value={dcafSalePct} min={0} max={100} step={5}
+                onChange={setDcafSalePct} display={v => `${v}%`}
+                desc={`${dcafSalePct}% liquidation = $${(AUM_DCAF * dcafSalePct / 100).toFixed(1)}B one-off.`} />
+              <Toggle warn={true} label="Full dissolution" checked={dcafDissolve} onChange={setDcafDissolve}
+                desc="Wind up DCAF; AUM transferred to Consolidated Revenue. Requires repeal of DCAF Act 2013." />
+            </div>
+
+            {/* ATSILSFF */}
+            <div style={{ background:"#252830", border:"1px solid #3a3f48", borderRadius:4,
+              padding:"10px 12px", marginBottom:10 }}>
+              <div style={{ fontSize:11, color:"#c8d0dc", fontWeight:600, marginBottom:4 }}>
+                Aboriginal and Torres Strait Islander Land and Sea Future Fund (ATSILSFF) — ${AUM_ATSILSFF}B AUM
+              </div>
+              <div style={{ fontSize:10, color:"#9da3ae", marginBottom:8, lineHeight:1.5 }}>
+                Funds the Indigenous Land and Sea Corporation. Mandate target CPI+2-3%.
+              </div>
+              <Slider label="Additional contribution" value={atsilsffContrib} min={0} max={10} step={0.5}
+                onChange={setAtsilsffContrib} display={v => `$${v.toFixed(1)}B`} />
+              <Slider label="Disbursement uplift" value={atsilsffDisburseAdj} min={-0.05} max={1} step={0.05}
+                onChange={setAtsilsffDisburseAdj} display={v => `${v >= 0 ? '+' : ''}$${v.toFixed(2)}B/yr`}
+                desc="Additional flow to Indigenous Land and Sea Corporation operations." />
+              <Slider label="Partial sale" value={atsilsffSalePct} min={0} max={100} step={5}
+                onChange={setAtsilsffSalePct} display={v => `${v}%`} />
+              <Toggle warn={true} label="Full dissolution" checked={atsilsffDissolve} onChange={setAtsilsffDissolve}
+                desc="Politically highly sensitive; would require negotiation with First Nations representatives." />
+            </div>
+
+            {/* FDF, DRF, HAFF in compact grid */}
+            {[
+              { id:'fdf',  name:'Future Drought Fund',         aum:AUM_FDF,  act:'Future Drought Fund Act 2019', baseline:'~$100M/yr drought resilience disbursement',
+                contrib:fdfContrib,  setContrib:setFdfContrib,  disb:fdfDisburseAdj,  setDisb:setFdfDisburseAdj,
+                sale:fdfSalePct,     setSale:setFdfSalePct,     diss:fdfDissolve,     setDiss:setFdfDissolve },
+              { id:'drf',  name:'Disaster Ready Fund',          aum:AUM_DRF,  act:'Originally Emergency Response Fund Act 2019; repurposed March 2023', baseline:'Up to $200M/yr disaster resilience',
+                contrib:drfContrib,  setContrib:setDrfContrib,  disb:drfDisburseAdj,  setDisb:setDrfDisburseAdj,
+                sale:drfSalePct,     setSale:setDrfSalePct,     diss:drfDissolve,     setDiss:setDrfDissolve },
+              { id:'haff', name:'Housing Australia Future Fund', aum:AUM_HAFF, act:'Housing Australia Future Fund Act 2023', baseline:'$500M/yr to social/affordable housing',
+                contrib:haffContrib, setContrib:setHaffContrib, disb:haffDisburseAdj, setDisb:setHaffDisburseAdj,
+                sale:haffSalePct,    setSale:setHaffSalePct,    diss:haffDissolve,    setDiss:setHaffDissolve },
+            ].map(f => (
+              <div key={f.id} style={{ background:"#252830", border:"1px solid #3a3f48", borderRadius:4,
+                padding:"10px 12px", marginBottom:10 }}>
+                <div style={{ fontSize:11, color:"#c8d0dc", fontWeight:600, marginBottom:4 }}>
+                  {f.name} — ${f.aum}B AUM
+                </div>
+                <div style={{ fontSize:10, color:"#9da3ae", marginBottom:8, lineHeight:1.5 }}>
+                  {f.act}. Baseline: {f.baseline}. Mandate target CPI+2-3%.
+                </div>
+                <Slider label="Additional contribution" value={f.contrib} min={0} max={20} step={0.5}
+                  onChange={f.setContrib} display={v => `$${v.toFixed(1)}B`} />
+                <Slider label="Disbursement uplift" value={f.disb} min={-0.5} max={5} step={0.05}
+                  onChange={f.setDisb} display={v => `${v >= 0 ? '+' : ''}$${v.toFixed(2)}B/yr`}
+                  desc="Negative reduces disbursement (saves spending); positive expands." />
+                <Slider label="Partial sale" value={f.sale} min={0} max={100} step={5}
+                  onChange={f.setSale} display={v => `${v}%`}
+                  desc={`${f.sale}% = $${(f.aum * f.sale / 100).toFixed(1)}B one-off.`} />
+                <Toggle warn={true} label="Full dissolution" checked={f.diss} onChange={f.setDiss}
+                  desc={`Wind up. Requires repeal of enabling Act.`} />
+              </div>
+            ))}
+
+            {/* ── B. Separate Commonwealth investment corporations ── */}
+            <div style={{ fontSize:10, color:"#d9b16c", fontWeight:600, letterSpacing:"0.04em",
+              marginBottom:8, marginTop:14 }}>
+              B. Separate Commonwealth investment corporations
+            </div>
+
+            {/* CEFC */}
+            <div style={{ background:"#252830", border:"1px solid #3a3f48", borderRadius:4,
+              padding:"10px 12px", marginBottom:10 }}>
+              <div style={{ fontSize:11, color:"#c8d0dc", fontWeight:600, marginBottom:4 }}>
+                Clean Energy Finance Corporation (CEFC) — ${AUM_CEFC}B capital allocation
+              </div>
+              <div style={{ fontSize:10, color:"#9da3ae", marginBottom:8, lineHeight:1.5 }}>
+                Clean Energy Finance Corporation Act 2012. Lifetime $24.2B committed across 420+
+                transactions ($97B total transaction value). Current target return: 5-yr govt bond + 2-3%.
+                Coalition 2014 policy: full abolition. 2025-26 Budget added $2B new allocation.
+              </div>
+              <Slider label="Additional capital allocation" value={cefcContrib} min={0} max={50} step={1}
+                onChange={setCefcContrib} display={v => `$${v}B`}
+                desc="Top-up beyond current $30.5B. Each $1B unlocks ~$4B private co-investment (historical ratio)." />
+              <Slider label="Target return" value={cefcTargetReturn} min={1} max={8} step={0.25}
+                onChange={setCefcTargetReturn} display={v => `${v.toFixed(2)}%/yr`}
+                desc="Lower target = more concessional finance = more private capital crowded in." />
+              <Slider label="Partial sale / wind-down" value={cefcSalePct} min={0} max={100} step={5}
+                onChange={setCefcSalePct} display={v => `${v}%`}
+                desc={`${cefcSalePct}% liquidation = $${(AUM_CEFC * cefcSalePct / 100).toFixed(1)}B one-off.`} />
+              <Toggle warn={true} label="Full abolition" checked={cefcDissolve} onChange={setCefcDissolve}
+                desc="Coalition 2013-14 attempted CEFC abolition (blocked by Senate). Would require repeal of CEFC Act 2012." />
+            </div>
+
+            {/* NRFC */}
+            <div style={{ background:"#252830", border:"1px solid #3a3f48", borderRadius:4,
+              padding:"10px 12px", marginBottom:10 }}>
+              <div style={{ fontSize:11, color:"#c8d0dc", fontWeight:600, marginBottom:4 }}>
+                National Reconstruction Fund Corporation (NRFC) — ${AUM_NRFC}B
+              </div>
+              <div style={{ fontSize:10, color:"#9da3ae", marginBottom:8, lineHeight:1.5 }}>
+                National Reconstruction Fund Corporation Act 2023. $5B credited at commencement,
+                $10B by 2 July 2029. Eight priority areas: renewables, medical, transport, agriculture,
+                resources, defence capability, enabling capabilities, plus the $5B Net Zero Fund sub-fund
+                (announced Sept 2025).
+              </div>
+              <Slider label="Additional capital allocation" value={nrfcContrib} min={0} max={30} step={1}
+                onChange={setNrfcContrib} display={v => `$${v}B`} desc="Top-up beyond legislated $15B." />
+              <Slider label="Target return" value={nrfcTargetReturn} min={1} max={8} step={0.25}
+                onChange={setNrfcTargetReturn} display={v => `${v.toFixed(2)}%/yr`}
+                desc="Net Zero sub-fund is more concessional (5-yr bond − 1%); general portfolio bond + 2-3%." />
+              <Slider label="Partial sale / wind-down" value={nrfcSalePct} min={0} max={100} step={5}
+                onChange={setNrfcSalePct} display={v => `${v}%`}
+                desc={`${nrfcSalePct}% liquidation = $${(AUM_NRFC * nrfcSalePct / 100).toFixed(1)}B one-off.`} />
+              <Toggle warn={true} label="Full abolition" checked={nrfcDissolve} onChange={setNrfcDissolve}
+                desc="Would require repeal of NRFC Act 2023. Coalition 2023 voted against establishment." />
+            </div>
+
+            {/* ── C. New proposed funds ── */}
+            <div style={{ fontSize:10, color:"#d9b16c", fontWeight:600, letterSpacing:"0.04em",
+              marginBottom:8, marginTop:14 }}>
+              C. New proposed sovereign funds (off by default)
+            </div>
+
+            <Toggle label="Sovereign Wealth Fund (Norwegian model)" checked={newSoverFund} onChange={setNewSoverFund}
+              desc="A general resource-rents sovereign wealth fund modelled on Norway's Government Pension Fund Global ($1.7T AUM). Captures volatile resource rents (LNG, iron ore) and recycles to long-term intergenerational savings." />
+            {newSoverFund && (<>
+              <Slider label="Initial capitalisation" value={newSoverFundCapB} min={5} max={100} step={5}
+                onChange={setNewSoverFundCapB} display={v => `$${v}B`}
+                desc="20% deployed in budget year; remainder over forward estimates. Funded by PRRT uplift and resource taxes." />
+              <Slider label="Annual top-up from resource rents" value={newSoverFundContribAnnual} min={0} max={20} step={1}
+                onChange={setNewSoverFundContribAnnual} display={v => `$${v}B/yr`}
+                desc="Norway's model: 100% of state petroleum revenue. Australia equivalent: PRRT + mineral royalties dividend." />
+            </>)}
+
+            <Toggle label="Future Generations Fund (intergenerational equity)" checked={newGenFund} onChange={setNewGenFund}
+              desc="A sovereign fund earmarked for intergenerational transfers (climate transition, public service legacy costs). Distinct from Future Fund's specific super-liability purpose." />
+            {newGenFund && (
+              <Slider label="Initial capitalisation" value={newGenFundCapB} min={5} max={50} step={5}
+                onChange={setNewGenFundCapB} display={v => `$${v}B`} />
+            )}
+
+            <Toggle label="National Infrastructure Investment Fund" checked={newInfraFund} onChange={setNewInfraFund}
+              desc="Long-term infrastructure investment vehicle separate from annual infrastructure appropriations. Modelled on UK National Infrastructure Bank, Canadian Infrastructure Bank." />
+            {newInfraFund && (
+              <Slider label="Initial capitalisation" value={newInfraFundCapB} min={5} max={100} step={5}
+                onChange={setNewInfraFundCapB} display={v => `$${v}B`} />
+            )}
+
+            <Toggle label="Defence Industry Investment Fund (post-AUKUS)" checked={newDefenceFund} onChange={setNewDefenceFund}
+              desc="Dedicated sovereign capability fund for AUKUS Pillar II technologies, missile production, and sovereign munitions. Distinct from defence appropriation." />
+            {newDefenceFund && (
+              <Slider label="Initial capitalisation" value={newDefenceFundCapB} min={5} max={50} step={5}
+                onChange={setNewDefenceFundCapB} display={v => `$${v}B`} />
+            )}
+          </Sec>
+        </div>
+      </div>
+
+      {/* ── FOOTER ── */}
+      <div style={{ borderTop:"1px solid #4a4f59", padding:"10px 20px", background:"#282c34",
+        fontSize:10, color:"#4a4f59" }}>
+        Baseline: 2026-27 Budget (12 May 2026) · Receipts $798.1B · Payments $829.6B · UCB −$31.5B · GDP $3,094B ·
+        Income tax pools calibrated to ATO 2026-27 distribution data under Stage 4 settings ·
+        GST flows pass through to states under the Federal Financial Relations Act 2009 (Cth) ·
+        Fuel excise modelled net of Fuel Tax Credits ·
+        Public Debt Interest of $31.9B is locked (grows with debt path) ·
+        State payments of $207.8B itemised in the structural context panel ·
+        Phase 5 Budget measures (WATO, neg-gearing reform, trust min tax, etc.) included as toggleable levers ·
+        Auto-save via artifact storage API · Mobile-responsive layout · Not a Treasury model.
+      </div>
+    </div>
+    </CollapseCtx.Provider>
+  );
+}

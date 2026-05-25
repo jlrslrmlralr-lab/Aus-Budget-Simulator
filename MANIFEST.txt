@@ -1,0 +1,17 @@
+Australian Federal Budget Simulator — v13 Snapshot Manifest
+============================================================
+Snapshot generated: 2026-05-25T02:59:32Z
+Source file: AusBudgetSim.jsx (working version)
+
+Files in this archive:
+  AusBudgetSim_v13-funds-presets-mobile_2026-05-25.jsx           455312 bytes   6532 lines  md5=978a19eac036a9e1a672022cec4cb965
+  README.md                                                        9525 bytes    175 lines  md5=92d450c6c095fa529c45c83a018272fa
+
+To restore:
+  1. Extract this archive
+  2. Open AusBudgetSim_v13-funds-presets-mobile_2026-05-25.jsx in a React 18+ runtime
+  3. Ensure Recharts library is available
+  4. The component is self-contained — no additional state, no external imports beyond Recharts
+
+To continue development:
+  Upload the .jsx file to a new Claude conversation and ask Claude to load it as an artifact.
